@@ -15,6 +15,7 @@ int main(int argc, char** argv) {
     std::string want = argc > 2 ? argv[2] : "";
     std::map<std::string, int> cats, props;
     std::map<std::string, int> seen;
+    std::vector<oc::ItemDef> all;
     int total = 0, dup = 0;
     for (auto& e : fs::directory_iterator(argv[1])) {
         std::string p = e.path().string();
@@ -27,6 +28,7 @@ int main(int argc, char** argv) {
             oc::collectItems(oc::parseScript(std::string(b.begin(), b.end())), items);
             for (auto& it : items) {
                 total++;
+                all.push_back(it);
                 if (seen[it.id]++) dup++;
                 cats[it.base.empty() ? it.category : "(derived from another item)"]++;
                 for (auto& pr : it.props) props[pr.first]++;
@@ -42,6 +44,11 @@ int main(int argc, char** argv) {
         }
     }
     if (want.empty()) {
+        std::map<std::string, int> plain;
+        for (auto& i : all) if (i.base.empty()) plain[i.id]++;
+        int derived = 0, resolved = 0, ownMesh = 0;
+        for (auto& i : all) if (!i.base.empty()) { derived++; resolved += plain.count(i.base) ? 1 : 0; ownMesh += i.first("Mesh") ? 1 : 0; }
+        printf("derived items %d, base defined as a plain item %d, with own Mesh %d\n", derived, resolved, ownMesh);
         printf("%d items (%zu distinct ids, %d redefinitions)\n", total, seen.size(), dup);
         for (auto& c : cats) printf("  %-34s %d\n", c.first.c_str(), c.second);
         printf("most common properties:\n");

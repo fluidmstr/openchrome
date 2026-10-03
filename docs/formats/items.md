@@ -16,4 +16,6 @@ Counts over all files: 7606 `Item` blocks, 6281 distinct ids (1325 ids are defin
 
 Most common properties: `ItemType`, `Mesh`, `Color`, `GameVersion`, `Condition`, `DamageType`, `HudIcon`, `CriticalProb`, `Skin`, `UpgradeLevel`, `Price`, `InventoryMeshHq`, `RepairPart`, `Visibility`, `PhysicsScript`, `Name`, `CutTypesGroup`, `RequiredItem`, `AnimPrefix`. `Mesh` names resolve to `.msh` resources in the packs and `Skin` to a material skin of that mesh, so items can be shown with the existing viewer pipeline.
 
-Open: resolution of derived items (property inheritance and override order), meaning of `Condition`/`UpgradeLevel` chains, and how `Name` / `Description` text keys map to localisation tables.
+Derived items: of the 3679, 3570 name a base that is defined as a plain item (the other 109 point at ids defined only through other derived items or elsewhere); none of them sets its own `Mesh`, so the mesh is inherited from the base.
+
+Open: the exact inheritance and override order of derived items, meaning of `Condition`/`UpgradeLevel` chains, and how `Name` / `Description` text keys map to localisation tables.
