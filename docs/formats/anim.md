@@ -16,7 +16,13 @@ Bone hash (verified): `h = h * 41 + c` over the bone name bytes (u32, start 0, a
 
 ## ANM2 payload (partly understood)
 
-After the hashes: two `(frames-1)|1<<16` words, a u32 tag, then a u16 table. In a static clip (`m_npc_reset_anim`, 3 frames) the payload is simply 9 floats per bone: quaternion xyz, position xyz, scale xyz (scale stored as `0.99999994`); the u16 table holds `bones*9` = channel count. In an animated clip the table ends with `[static channels, animated channels, total = bones*9, ?]` (basket clip: 690, 147, 837, 1216), followed by 16-float units (8 values + 8 x `0x37a7c5ac`), a tail of static values and a bit-packed stream. The unit/stream layout is not decoded.
+Payload starts after the bone hashes (`o = 32 + 4*bones`): `u32 (frames-1)|1<<16` twice, a u32 tag, then a u16 table. Channels are 9 per bone in bone order: quaternion xyz, position xyz, scale xyz (w = sqrt(1 - x^2 - y^2 - z^2)); scale is stored as `0.99999994`-style floats.
+
+The table contains `[static channels, animated channels, bones*9, X]` with `X = 64 * ceil(animated / 8)`; before it are increasing numbers (block table of the bit-packed stream, ~14 frames per block, meaning unknown) and the value `~7/3 * bones`.
+
+Verified for fully static clips (stand poses, `animated = 0`): the payload is 48 bytes of header followed by `bones*9` raw floats (bone-major), then 0xff padding. Example `fpp_chainsaw_a_standpose`, `m_npc_reset_anim`.
+
+Animated clips (not decoded): after the header come `X` bytes of per-animated-channel parameters in groups of 8 channels: 8 float bases then 8 floats scale (value `0x37a7c5ac` = 2.0e-5 appears as scale/unused marker), then the raw floats of the *static* channels only, then padding and a sparse bit-packed stream (16-byte rows mostly zero, so probably entropy/delta coded). Only the animated channels are in the stream, 2-147 of them per clip.
 
 ## Skeleton (verified, `tools/skel.py`)
 
