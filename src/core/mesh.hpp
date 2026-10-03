@@ -11,6 +11,7 @@ namespace oc {
 struct MeshGroup {
     std::vector<float> pos;        // xyz per vertex
     std::vector<float> uv;         // uv per vertex, empty if the vertex layout is unknown
+    std::vector<uint32_t> normal;  // packed snorm8 xyz(+pad) per vertex, empty if the layout is unknown
     std::vector<uint32_t> index;   // triangle list, local to the group
     std::vector<uint32_t> counts;  // index count per submesh
     int stride = 0;

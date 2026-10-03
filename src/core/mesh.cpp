@@ -31,6 +31,11 @@ int uvOffset(int stride) {
     switch (stride) { case 20: case 24: return 12; case 32: return 16; case 40: return 24; default: return -1; }
 }
 
+// Vertex normal (snorm8 xyz) offset per stride; verified against face normals (20, 32), weaker for skinned 40.
+int normalOffset(int stride) {
+    switch (stride) { case 20: return 8; case 32: return 12; case 40: return 20; default: return -1; }
+}
+
 struct Group { uint32_t V; std::vector<uint32_t> counts; };
 
 bool readGroups(View meta, View rel, std::vector<Group>& out) {
@@ -125,9 +130,12 @@ bool loadMesh(Pack& pack, const Resource& r, Mesh& out) {
         mg.pos.resize((size_t)g.V * 3);
         int uo = uvOffset(s);
         if (uo >= 0) mg.uv.resize((size_t)g.V * 2);
+        int no = normalOffset(s);
+        if (no >= 0) mg.normal.resize(g.V);
         for (uint32_t v = 0; v < g.V; v++) {
             const uint8_t* p = vb.data + off + (size_t)v * s;
             position(p, s, &mg.pos[3 * v]);
+            if (no >= 0) mg.normal[v] = rd<uint32_t>(p + no) & 0x00ffffffu;
             if (uo >= 0) {
                 mg.uv[2 * v] = half(rd<uint16_t>(p + uo));
                 mg.uv[2 * v + 1] = half(rd<uint16_t>(p + uo + 2));

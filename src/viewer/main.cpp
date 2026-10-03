@@ -47,7 +47,7 @@ struct GpuInstance { float pos[3], p0, scale[3], p1, quat[4]; };  // 48 bytes
 struct MatInfo { std::string name, tex; int slot = 0; int state = 0; };  // state: 0 pending, 1 resolved
 
 struct World {
-    std::vector<float> vertices;     // x y z u v
+    std::vector<float> vertices;     // x y z u v + packed snorm8 normal (uint32 bits), 6 floats per vertex
     std::vector<uint32_t> indices;
     std::vector<TypeGeom> geom;      // per object type
     std::vector<MatInfo> mats;       // material 0 is "no material"
@@ -75,7 +75,7 @@ static uint32_t matId(World& w, const std::string& name) {
 }
 
 static void appendGroup(World& w, const oc::MeshGroup& g, const std::vector<std::string>& mats, int32_t& vOff, std::vector<Sub>& subs) {
-    vOff = (int32_t)(w.vertices.size() / 5);
+    vOff = (int32_t)(w.vertices.size() / 6);
     uint32_t base = (uint32_t)w.indices.size();
     size_t nv = g.pos.size() / 3;
     auto clean = [](float f) { return std::isfinite(f) && std::fabs(f) < 1e6f ? f : 0.0f; };
@@ -83,6 +83,10 @@ static void appendGroup(World& w, const oc::MeshGroup& g, const std::vector<std:
         for (int k = 0; k < 3; k++) w.vertices.push_back(clean(g.pos[3 * v + k]));
         w.vertices.push_back(g.uv.empty() ? 0.0f : clean(g.uv[2 * v]));
         w.vertices.push_back(g.uv.empty() ? 0.0f : clean(g.uv[2 * v + 1]));
+        uint32_t nb = g.normal.empty() ? 0u : g.normal[v];
+        float nf;
+        memcpy(&nf, &nb, 4);
+        w.vertices.push_back(nf);
     }
     w.indices.insert(w.indices.end(), g.index.begin(), g.index.end());
     uint32_t acc = 0;
@@ -137,7 +141,7 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
         ok++;
     }
     printf("map %s: %zu instances, %zu/%zu types decoded, %zu vertices, %zu indices, %zu materials\n", map.c_str(), w.objects.instances.size(), ok,
-           w.objects.types.size(), w.vertices.size() / 5, w.indices.size(), w.mats.size());
+           w.objects.types.size(), w.vertices.size() / 6, w.indices.size(), w.mats.size());
 }
 
 // ---------------------------------------------------------------- vulkan helpers
@@ -363,6 +367,8 @@ static GpuTex createTexture(Gfx& g, const oc::Texture& tex) {
 }
 
 constexpr uint32_t MAX_TEX = 4096;
+constexpr uint32_t SHADOW_RES = 4096;
+struct FrameUbo { glm::mat4 lightVP; glm::vec4 sun; glm::vec4 params; };  // 96 bytes, one 256-byte slot per frame in flight
 
 struct Draw { uint32_t indexCount, instanceCount, firstIndex; int32_t vertexOffset; uint32_t firstInstance, mat; };
 
@@ -458,6 +464,11 @@ int main(int argc, char** argv) {
         b = makeBuffer(g, std::max<size_t>(maxInst, 1) * sizeof(GpuInstance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
 
+    Buf instShadow[FRAMES];
+    for (auto& b : instShadow)
+        b = makeBuffer(g, std::max<size_t>(maxInst, 1) * sizeof(GpuInstance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+
     // texture descriptors: one big array, slot 0 = default gray
     VkDescriptorSetLayoutBinding dlb{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_TEX, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     VkDescriptorBindingFlags dbf = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
@@ -496,23 +507,76 @@ int main(int argc, char** argv) {
     }
     uint32_t nextSlot = 1;
 
+    // shadow map + per-frame uniforms (descriptor set 1)
+    VkImage shadowImg;
+    VkDeviceMemory shadowMem;
+    VkImageView shadowView;
+    {
+        VkImageCreateInfo si2{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        si2.imageType = VK_IMAGE_TYPE_2D; si2.format = VK_FORMAT_D32_SFLOAT; si2.extent = {SHADOW_RES, SHADOW_RES, 1};
+        si2.mipLevels = 1; si2.arrayLayers = 1; si2.samples = VK_SAMPLE_COUNT_1_BIT; si2.tiling = VK_IMAGE_TILING_OPTIMAL;
+        si2.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT; si2.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VK(vkCreateImage(g.dev, &si2, nullptr, &shadowImg));
+        VkMemoryRequirements smr;
+        vkGetImageMemoryRequirements(g.dev, shadowImg, &smr);
+        VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        sai.allocationSize = smr.size; sai.memoryTypeIndex = findMem(g, smr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VK(vkAllocateMemory(g.dev, &sai, nullptr, &shadowMem));
+        VK(vkBindImageMemory(g.dev, shadowImg, shadowMem, 0));
+        VkImageViewCreateInfo svi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        svi.image = shadowImg; svi.viewType = VK_IMAGE_VIEW_TYPE_2D; svi.format = VK_FORMAT_D32_SFLOAT;
+        svi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        VK(vkCreateImageView(g.dev, &svi, nullptr, &shadowView));
+    }
+    VkSamplerCreateInfo shs{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    shs.magFilter = shs.minFilter = VK_FILTER_LINEAR; shs.addressModeU = shs.addressModeV = shs.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    shs.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; shs.compareEnable = VK_TRUE; shs.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VkSampler shadowSampler;
+    VK(vkCreateSampler(g.dev, &shs, nullptr, &shadowSampler));
+    Buf frameUbo = makeBuffer(g, 256 * 2, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+    VkDescriptorSetLayoutBinding sb[2] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sl.bindingCount = 2; sl.pBindings = sb;
+    VkDescriptorSetLayout dsl1;
+    VK(vkCreateDescriptorSetLayout(g.dev, &sl, nullptr, &dsl1));
+    VkDescriptorPoolSize dps1[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
+    VkDescriptorPoolCreateInfo dpci1{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci1.maxSets = 1; dpci1.poolSizeCount = 2; dpci1.pPoolSizes = dps1;
+    VkDescriptorPool dpool1;
+    VK(vkCreateDescriptorPool(g.dev, &dpci1, nullptr, &dpool1));
+    VkDescriptorSetAllocateInfo dsai1{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai1.descriptorPool = dpool1; dsai1.descriptorSetCount = 1; dsai1.pSetLayouts = &dsl1;
+    VkDescriptorSet dset1;
+    VK(vkAllocateDescriptorSets(g.dev, &dsai1, &dset1));
+    {
+        VkDescriptorBufferInfo bi1{frameUbo.buf, 0, sizeof(FrameUbo)};
+        VkDescriptorImageInfo ii1{shadowSampler, shadowView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet w1[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        w1[0].dstSet = dset1; w1[0].dstBinding = 0; w1[0].descriptorCount = 1; w1[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; w1[0].pBufferInfo = &bi1;
+        w1[1].dstSet = dset1; w1[1].dstBinding = 1; w1[1].descriptorCount = 1; w1[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w1[1].pImageInfo = &ii1;
+        vkUpdateDescriptorSets(g.dev, 2, w1, 0, nullptr);
+    }
+
     // pipeline
     std::string exeDir = SDL_GetBasePath();
     VkShaderModule vs = loadShader(g, exeDir + "mesh.vert.spv"), fsm = loadShader(g, exeDir + "mesh.frag.spv");
     VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(glm::mat4) + sizeof(glm::vec4) + 16};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 1; plci.pSetLayouts = &dsl; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    VkDescriptorSetLayout setLayouts[2] = {dsl, dsl1};
+    plci.setLayoutCount = 2; plci.pSetLayouts = setLayouts; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
     VkPipelineLayout layout;
     VK(vkCreatePipelineLayout(g.dev, &plci, nullptr, &layout));
     VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fsm; stages[1].pName = "main";
-    VkVertexInputBindingDescription binds[2] = {{0, 20, VK_VERTEX_INPUT_RATE_VERTEX}, {1, sizeof(GpuInstance), VK_VERTEX_INPUT_RATE_INSTANCE}};
-    VkVertexInputAttributeDescription attrs[5] = {
-        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32_SFLOAT, 12},
-        {2, 1, VK_FORMAT_R32G32B32_SFLOAT, 0}, {3, 1, VK_FORMAT_R32G32B32_SFLOAT, 16}, {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32}};
+    VkVertexInputBindingDescription binds[2] = {{0, 24, VK_VERTEX_INPUT_RATE_VERTEX}, {1, sizeof(GpuInstance), VK_VERTEX_INPUT_RATE_INSTANCE}};
+    VkVertexInputAttributeDescription attrs[6] = {
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32_SFLOAT, 12}, {2, 0, VK_FORMAT_R8G8B8A8_SNORM, 20},
+        {3, 1, VK_FORMAT_R32G32B32_SFLOAT, 0}, {4, 1, VK_FORMAT_R32G32B32_SFLOAT, 16}, {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32}};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = binds; vi.vertexAttributeDescriptionCount = 5; vi.pVertexAttributeDescriptions = attrs;
+    vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = binds; vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -538,6 +602,20 @@ int main(int argc, char** argv) {
     gpi.pColorBlendState = &cb; gpi.pDynamicState = &dsi; gpi.layout = layout;
     VkPipeline pipeline;
     VK(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipeline));
+    VkPipeline shadowPipeline;
+    {
+        VkShaderModule svs = loadShader(g, exeDir + "shadow.vert.spv");
+        VkPipelineShaderStageCreateInfo ss{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ss.stage = VK_SHADER_STAGE_VERTEX_BIT; ss.module = svs; ss.pName = "main";
+        VkPipelineRasterizationStateCreateInfo srs = rs;
+        srs.depthBiasEnable = VK_TRUE; srs.depthBiasConstantFactor = 2.0f; srs.depthBiasSlopeFactor = 2.5f;
+        VkPipelineColorBlendStateCreateInfo scb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        VkPipelineRenderingCreateInfo srci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        srci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+        VkGraphicsPipelineCreateInfo sg = gpi;
+        sg.pNext = &srci; sg.stageCount = 1; sg.pStages = &ss; sg.pRasterizationState = &srs; sg.pColorBlendState = &scb;
+        VK(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &sg, nullptr, &shadowPipeline));
+    }
 
     // frame resources
     VkCommandBuffer cmds[FRAMES];
@@ -563,7 +641,8 @@ int main(int argc, char** argv) {
     // per-frame culling scratch
     const size_t nb = world.geom.size() * 2;
     std::vector<uint32_t> counts(nb), starts(nb), fill(nb), vis, visBucket;
-    std::vector<Draw> draws;
+    std::vector<Draw> draws, shadowDraws;
+    std::vector<uint32_t> counts2(nb), starts2(nb), fill2(nb), vis2, visBucket2;
     SDL_SetRelativeMouseMode(shot.empty() ? SDL_TRUE : SDL_FALSE);
     float speed = 40.0f;
     uint64_t last = SDL_GetPerformanceCounter();
@@ -636,6 +715,53 @@ int main(int argc, char** argv) {
             for (const Sub& s : tg.subs[lod]) draws.push_back({s.count, counts[b], s.first, tg.vertexOffset[lod], starts[b], s.mat});
         }
 
+        // sun light matrix: one orthographic cascade around the camera, snapped to shadow texels
+        const glm::vec3 sunDir = glm::normalize(glm::vec3(0.45f, 0.75f, 0.35f));
+        const float S = 150.0f;
+        glm::vec3 C = camPos + glm::vec3(fwd.x, 0.0f, fwd.z) * 70.0f;
+        glm::mat4 lv = glm::lookAt(C + sunDir * 500.0f, C, glm::vec3(0, 1, 0));
+        {
+            float texel = 2.0f * S / (float)SHADOW_RES;
+            glm::vec4 lc = lv * glm::vec4(C, 1.0f);
+            glm::vec2 snapped(std::floor(lc.x / texel) * texel, std::floor(lc.y / texel) * texel);
+            lv = glm::translate(glm::mat4(1.0f), glm::vec3(snapped.x - lc.x, snapped.y - lc.y, 0.0f)) * lv;
+        }
+        glm::mat4 lightVP = glm::ortho(-S, S, -S, S, 0.0f, 1000.0f) * lv;
+        std::fill(counts2.begin(), counts2.end(), 0u);
+        vis2.clear(); visBucket2.clear();
+        const float sr2 = S * 1.7f * S * 1.7f;
+        for (size_t i = 0; i < maxInst; i++) {
+            const oc::Instance& in = world.objects.instances[i];
+            if (!world.geom[in.type].valid) continue;
+            glm::vec3 d(in.pos[0] - C.x, in.pos[1] - C.y, in.pos[2] - C.z);
+            if (glm::dot(d, d) > sr2) continue;
+            glm::vec3 dc(in.pos[0] - camPos.x, in.pos[1] - camPos.y, in.pos[2] - camPos.z);
+            uint32_t b = in.type * 2 + (glm::dot(dc, dc) > lodDist2 ? 1 : 0);
+            vis2.push_back((uint32_t)i); visBucket2.push_back(b); counts2[b]++;
+        }
+        run = 0;
+        for (size_t b = 0; b < nb; b++) { starts2[b] = run; fill2[b] = 0; run += counts2[b]; }
+        GpuInstance* dst2 = (GpuInstance*)instShadow[fi].map;
+        for (size_t v = 0; v < vis2.size(); v++) {
+            const oc::Instance& in = world.objects.instances[vis2[v]];
+            GpuInstance& o = dst2[starts2[visBucket2[v]] + fill2[visBucket2[v]]++];
+            memcpy(o.pos, in.pos, 12); memcpy(o.scale, in.scale, 12);
+            for (int c = 0; c < 4; c++) o.quat[c] = in.quat[c] / 32767.0f;
+        }
+        shadowDraws.clear();
+        for (size_t b = 0; b < nb; b++) {
+            if (!counts2[b]) continue;
+            const TypeGeom& tg = world.geom[b / 2];
+            const auto& subs = tg.subs[b & 1];
+            if (subs.empty()) continue;
+            shadowDraws.push_back({subs.back().first + subs.back().count - subs.front().first, counts2[b], subs.front().first, tg.vertexOffset[b & 1], starts2[b], 0});
+        }
+        {
+            FrameUbo u;
+            u.lightVP = lightVP; u.sun = glm::vec4(sunDir, 1.0f); u.params = glm::vec4(1.0f / SHADOW_RES, 0, 0, 0);
+            memcpy((uint8_t*)frameUbo.map + 256 * fi, &u, sizeof u);
+        }
+
         // stream in a few diffuse textures per frame for materials that are on screen
         int budget = shot.empty() ? 6 : 400;
         for (const Draw& d : draws) {
@@ -655,6 +781,33 @@ int main(int argc, char** argv) {
         VK(vkResetCommandBuffer(cmd, 0));
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VK(vkBeginCommandBuffer(cmd, &bi));
+        // shadow pass
+        imageBarrier(cmd, shadowImg, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        {
+            VkRenderingAttachmentInfo sda{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            sda.imageView = shadowView; sda.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; sda.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            sda.storeOp = VK_ATTACHMENT_STORE_OP_STORE; sda.clearValue.depthStencil = {1.0f, 0};
+            VkRenderingInfo sri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            sri.renderArea = {{0, 0}, {SHADOW_RES, SHADOW_RES}}; sri.layerCount = 1; sri.pDepthAttachment = &sda;
+            vkCmdBeginRendering(cmd, &sri);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline);
+            VkViewport svp{0, 0, (float)SHADOW_RES, (float)SHADOW_RES, 0, 1};
+            VkRect2D ssc{{0, 0}, {SHADOW_RES, SHADOW_RES}};
+            vkCmdSetViewport(cmd, 0, 1, &svp);
+            vkCmdSetScissor(cmd, 0, 1, &ssc);
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof lightVP, &lightVP);
+            VkBuffer svbs[2] = {vbuf.buf, instShadow[fi].buf};
+            VkDeviceSize soffs[2] = {0, 0};
+            vkCmdBindVertexBuffers(cmd, 0, 2, svbs, soffs);
+            vkCmdBindIndexBuffer(cmd, ibuf.buf, 0, VK_INDEX_TYPE_UINT32);
+            for (const Draw& d : shadowDraws) vkCmdDrawIndexed(cmd, d.indexCount, d.instanceCount, d.firstIndex, d.vertexOffset, d.firstInstance);
+            vkCmdEndRendering(cmd);
+        }
+        imageBarrier(cmd, shadowImg, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
         imageBarrier(cmd, g.images[imgIdx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                      VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
         imageBarrier(cmd, g.depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
@@ -685,6 +838,8 @@ int main(int argc, char** argv) {
         vkCmdBindVertexBuffers(cmd, 0, 2, vbs, offs);
         vkCmdBindIndexBuffer(cmd, ibuf.buf, 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &dset, 0, nullptr);
+        uint32_t uboOff = 256u * (uint32_t)fi;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &dset1, 1, &uboOff);
         for (const Draw& d : draws) {
             pc.tex = (uint32_t)world.mats[d.mat].slot;
             vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
