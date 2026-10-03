@@ -133,6 +133,14 @@ bool baseName(const std::string& name, const char* tok, std::string& out) {
 }
 }  // namespace
 
+std::string MaterialDb::sampler(const std::string& mat, const char* name) const {
+    auto k = matKey_.find(mat);
+    if (k == matKey_.end()) return {};
+    auto b = blobs_.find(k->second);
+    if (b == blobs_.end() || b->second.first + b->second.second > file_.size()) return {};
+    return bound(std::vector<uint8_t>(file_.begin() + b->second.first, file_.begin() + b->second.first + b->second.second), {name});
+}
+
 std::string MaterialDb::diffuse(const std::string& mat, const std::function<bool(const std::string&)>& exists) const {
     auto k = matKey_.find(mat);
     if (k == matKey_.end()) return {};

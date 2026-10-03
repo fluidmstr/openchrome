@@ -32,7 +32,7 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6), wri
 
 ### Characters
 
-Character meshes are skinned kits (head, torso, legs, hair and their LODs as separate groups). The viewer reads the skeleton stored in the mesh, the per-submesh bone palettes and the vertex weights, then applies a pose from a static animation clip (here: bind pose and an NPC reset pose). Skin, clothes and faces use the textures bound by their materials; the colour-grading masks (`s_grd`, `s_idx`), so the clothes are still undyed, and the normal and specular maps are not applied yet.
+Character meshes are skinned kits (head, torso, legs, hair and their LODs as separate groups). The viewer reads the skeleton stored in the mesh, the per-submesh bone palettes and the vertex weights, then applies a pose from a static animation clip (here: bind pose and an NPC reset pose). Skin, clothes and faces use the textures bound by their materials; clothes are dyed from the `s_idx` mask and the `s_grd` colour palette (palette row 0 for now). Normal and specular maps are not applied yet.
 
 ```
 oc_viewer "<DW dir>" old_town --nomap ^

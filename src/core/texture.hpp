@@ -20,4 +20,7 @@ struct Texture {
 // Decodes a 2D texture, dropping mip levels larger than maxDim. False for cubemaps / unknown formats.
 bool loadTexture(Pack& pack, const Resource& r, uint32_t maxDim, Texture& out);
 
+// Dye: albedo * palette[row][mask.r mapped to 0..15] (character `s_grd` palette 16 wide, `s_idx` mask); returns an RGBA8 texture with a full mip chain.
+bool tintTexture(const Texture& albedo, const Texture& mask, const Texture& palette, uint32_t row, Texture& out);
+
 }  // namespace oc

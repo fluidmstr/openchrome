@@ -51,3 +51,7 @@ Open: the real blend of the tiling layers and the `dye` tint, car paint (green f
 
 Binding: the material's slot records are in ascending order of `flags & 0xfff` of the template's samplers (flags with bits 0xf000 set are global samplers, skipped). Record *i* is the texture of sampler *i*. In 90% of materials the counts match; the rest (extra global samplers) fall back to the name heuristic.
 Albedo = texture bound to `s_dif_0`, else `s_clr`, `s_dif`, `s_det_clr_0` (`MaterialDb::bound`). Terrain blends use `s_dif_0..2` (layers) + `s_nrm_*`/`s_spc_*`; blend weights come from elsewhere (vertex colour / `_t2mat.scr`), not decoded.
+
+## Character dye (guessed, looks right)
+
+Clothing materials bind `s_idx` (mask, same UV as the albedo) and `s_grd` (16x32 RGBA8 palette). Rendered colour = albedo * `s_grd[row][round(mask.r * 15 / 255)]`; rows are colour variants (the viewer uses row 0). Verified only visually on `survivor_woman_torso_b` / `legs_b`: regions of the mask map to coherent garment parts. Which row the game picks per character is unknown.

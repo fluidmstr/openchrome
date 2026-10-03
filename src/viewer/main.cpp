@@ -46,7 +46,7 @@ struct TypeGeom {
 
 struct GpuInstance { float pos[3], p0, scale[3], p1, quat[4]; };  // 48 bytes
 
-struct MatInfo { std::string name, tex; int slot = 0; int state = 0; };  // state: 0 pending, 1 resolved
+struct MatInfo { std::string name, tex, dyeMask, dyePal; int slot = 0; int state = 0; };  // state: 0 pending, 1 resolved
 
 struct Spawn { std::string mesh, clip; float pos[3]; float yaw; std::vector<int> parts; std::map<int, std::string> partMat; };  // --spawn: skinned character in a static pose
 
@@ -76,7 +76,12 @@ static uint32_t matId(World& w, const std::string& name) {
     auto it = w.matIndex.find(name);
     if (it != w.matIndex.end()) return it->second;
     uint32_t id = (uint32_t)w.mats.size();
-    w.mats.push_back({name, w.db ? w.db->diffuse(name, [&](const std::string& n) { return w.textures.count(n) > 0; }) : std::string(), 0, 0});
+    MatInfo mi{name, w.db ? w.db->diffuse(name, [&](const std::string& n) { return w.textures.count(n) > 0; }) : std::string(), "", "", 0, 0};
+    if (w.db) {
+        mi.dyeMask = w.db->sampler(name, "s_idx"); mi.dyePal = w.db->sampler(name, "s_grd");
+        if (!w.textures.count(mi.dyeMask) || !w.textures.count(mi.dyePal)) mi.dyeMask = mi.dyePal = "";
+    }
+    w.mats.push_back(mi);
     w.matIndex[name] = id;
     return id;
 }
@@ -186,7 +191,7 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
         }
     }
     try { w.db = std::make_unique<oc::MaterialDb>((dw / "Data" / "optimized_dx11.mp").string()); } catch (std::exception& ex) { fprintf(stderr, "materials: %s\n", ex.what()); }
-    w.mats.push_back({"", "", 0, 1});
+    w.mats.push_back({"", "", "", "", 0, 1});
     // far terrain ("terrain_horizon") meshes are baked in world space and not listed in the .sobj: add them at the origin
     if (!w.nomap) {
         std::string pre1 = map + "_terrain_horizon", pre2 = map == "old_town" ? "ot_terrain_horizon" : std::string("?");
@@ -1023,6 +1028,14 @@ int main(int argc, char** argv) {
             oc::Texture tex;
             try { if (!oc::loadTexture(*it->second.first, *it->second.second, 1024, tex)) continue; } catch (std::exception&) { continue; }
             budget--;
+            if (!m.dyeMask.empty()) {
+                oc::Texture mask, pal, dyed;
+                auto im = world.textures.find(m.dyeMask), ip = world.textures.find(m.dyePal);
+                try {
+                    if (oc::loadTexture(*im->second.first, *im->second.second, 1024, mask) && oc::loadTexture(*ip->second.first, *ip->second.second, 1024, pal) &&
+                        oc::tintTexture(tex, mask, pal, 0, dyed)) tex = std::move(dyed);
+                } catch (std::exception&) {}
+            }
             setSlot(nextSlot, createTexture(g, tex).view);
             m.slot = (int)nextSlot++;
         }
