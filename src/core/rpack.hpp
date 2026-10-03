@@ -19,6 +19,7 @@ struct View { const uint8_t* data = nullptr; size_t size = 0; };
 
 enum : uint8_t { ROLE_META = 0x10, ROLE_REL = 0x11, ROLE_VB = 0xf0, ROLE_IB = 0xf1 };
 constexpr uint32_t TYPE_MESH = 0x01100005;
+constexpr uint32_t TYPE_TEXTURE_2D = 0x21200002, TYPE_TEXTURE_CUBE = 0x21200003;
 
 class Pack {
 public:
@@ -27,6 +28,8 @@ public:
     const std::string& path() const { return path_; }
     // chunk of `r` living in a stream with the given role (empty View if none)
     View chunk(const Resource& r, uint8_t role);
+    // data of one specific chunk of a resource
+    View chunkData(const Chunk& c);
 private:
     struct Stream { uint32_t flags, offset, usize, csize; std::vector<uint8_t> data; bool loaded = false; };
     const std::vector<uint8_t>& stream(size_t i);

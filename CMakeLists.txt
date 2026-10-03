@@ -8,7 +8,7 @@ FetchContent_Declare(zlib URL https://github.com/madler/zlib/archive/refs/tags/v
 set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zlib)
 
-add_library(oc_core src/core/rpack.cpp src/core/mesh.cpp src/core/sobj.cpp src/core/zip.cpp)
+add_library(oc_core src/core/rpack.cpp src/core/mesh.cpp src/core/sobj.cpp src/core/zip.cpp src/core/mp.cpp src/core/texture.cpp)
 target_include_directories(oc_core PUBLIC src ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
 target_link_libraries(oc_core PUBLIC zlibstatic)
 if(MSVC)

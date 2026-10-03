@@ -72,6 +72,14 @@ const std::vector<uint8_t>& Pack::stream(size_t i) {
     return s.data;
 }
 
+View Pack::chunkData(const Chunk& c) {
+    size_t si = c.part & 0xff;
+    if (si >= streams_.size()) return {};
+    const auto& d = stream(si);
+    if ((size_t)c.offset + c.size > d.size()) return {};
+    return {d.data() + c.offset, c.size};
+}
+
 View Pack::chunk(const Resource& r, uint8_t role) {
     for (const Chunk& c : r.chunks) {
         size_t si = c.part & 0xff;

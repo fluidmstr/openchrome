@@ -22,6 +22,8 @@
 #include <vector>
 
 #include "core/mesh.hpp"
+#include "core/mp.hpp"
+#include "core/texture.hpp"
 #include "core/rpack.hpp"
 #include "core/sobj.hpp"
 #include "core/zip.hpp"
@@ -32,19 +34,27 @@ namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------- world data
 
+struct Sub { uint32_t first, count, mat; };
+
 struct TypeGeom {
     bool valid = false;
     int32_t vertexOffset[2] = {0, 0};
-    uint32_t firstIndex[2] = {0, 0}, indexCount[2] = {0, 0};
+    std::vector<Sub> subs[2];  // per LOD (0 = near, 1 = far)
 };
 
 struct GpuInstance { float pos[3], p0, scale[3], p1, quat[4]; };  // 48 bytes
 
+struct MatInfo { std::string name, tex; int slot = 0; int state = 0; };  // state: 0 pending, 1 resolved
+
 struct World {
-    std::vector<float> vertices;     // xyz
+    std::vector<float> vertices;     // x y z u v
     std::vector<uint32_t> indices;
     std::vector<TypeGeom> geom;      // per object type
+    std::vector<MatInfo> mats;       // material 0 is "no material"
+    std::map<std::string, uint32_t> matIndex;
     oc::StaticObjects objects;
+    std::map<std::string, std::pair<oc::Pack*, const oc::Resource*>> textures;
+    std::unique_ptr<oc::MaterialDb> db;
 };
 
 static bool skipType(const std::string& mesh) {
@@ -55,12 +65,32 @@ static bool skipType(const std::string& mesh) {
     return false;
 }
 
-static void appendGroup(World& w, const oc::MeshGroup& g, int32_t& vOff, uint32_t& first, uint32_t& count) {
-    vOff = (int32_t)(w.vertices.size() / 3);
-    first = (uint32_t)w.indices.size();
-    count = (uint32_t)g.index.size();
-    for (float f : g.pos) w.vertices.push_back(std::isfinite(f) ? f : 0.0f);
+static uint32_t matId(World& w, const std::string& name) {
+    auto it = w.matIndex.find(name);
+    if (it != w.matIndex.end()) return it->second;
+    uint32_t id = (uint32_t)w.mats.size();
+    w.mats.push_back({name, w.db ? w.db->diffuse(name) : std::string(), 0, 0});
+    w.matIndex[name] = id;
+    return id;
+}
+
+static void appendGroup(World& w, const oc::MeshGroup& g, const std::vector<std::string>& mats, int32_t& vOff, std::vector<Sub>& subs) {
+    vOff = (int32_t)(w.vertices.size() / 5);
+    uint32_t base = (uint32_t)w.indices.size();
+    size_t nv = g.pos.size() / 3;
+    auto clean = [](float f) { return std::isfinite(f) && std::fabs(f) < 1e6f ? f : 0.0f; };
+    for (size_t v = 0; v < nv; v++) {
+        for (int k = 0; k < 3; k++) w.vertices.push_back(clean(g.pos[3 * v + k]));
+        w.vertices.push_back(g.uv.empty() ? 0.0f : clean(g.uv[2 * v]));
+        w.vertices.push_back(g.uv.empty() ? 0.0f : clean(g.uv[2 * v + 1]));
+    }
     w.indices.insert(w.indices.end(), g.index.begin(), g.index.end());
+    uint32_t acc = 0;
+    for (size_t k = 0; k < g.counts.size(); k++) {
+        uint32_t m = mats.empty() ? 0 : matId(w, mats[std::min(k, mats.size() - 1)]);
+        subs.push_back({base + acc, g.counts[k], m});
+        acc += g.counts[k];
+    }
 }
 
 static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
@@ -75,8 +105,13 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
     for (auto& e : fs::directory_iterator(dw / "Data")) {
         if (e.path().extension() != ".rpack") continue;
         try { packs.push_back(std::make_unique<oc::Pack>(e.path().string())); } catch (std::exception&) { continue; }
-        for (auto& r : packs.back()->resources()) if (r.flags == oc::TYPE_MESH) index.emplace(r.name, std::make_pair(packs.back().get(), &r));
+        for (auto& r : packs.back()->resources()) {
+            if (r.flags == oc::TYPE_MESH) index.emplace(r.name, std::make_pair(packs.back().get(), &r));
+            else if (r.flags == oc::TYPE_TEXTURE_2D || r.flags == oc::TYPE_TEXTURE_CUBE) w.textures.emplace(r.name, std::make_pair(packs.back().get(), &r));
+        }
     }
+    try { w.db = std::make_unique<oc::MaterialDb>((dw / "Data" / "optimized_dx11.mp").string()); } catch (std::exception& ex) { fprintf(stderr, "materials: %s\n", ex.what()); }
+    w.mats.push_back({"", "", 0, 1});
     w.geom.resize(w.objects.types.size());
     std::vector<char> used(w.objects.types.size(), 0);
     for (auto& i : w.objects.instances) used[i.type] = 1;
@@ -92,17 +127,17 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
         if (m.groups[0].index.empty()) continue;
         TypeGeom& g = w.geom[t];
         g.valid = true;
-        appendGroup(w, m.groups[0], g.vertexOffset[0], g.firstIndex[0], g.indexCount[0]);
+        appendGroup(w, m.groups[0], m.materials, g.vertexOffset[0], g.subs[0]);
         // far LOD: last group, but only when the groups really are a LOD chain (vertex counts shrink)
         size_t last = m.groups.size() - 1;
         bool chain = last > 0;
         for (size_t i = 1; i <= last && chain; i++) chain = m.groups[i].pos.size() <= m.groups[i - 1].pos.size() && !m.groups[i].index.empty();
-        if (chain) appendGroup(w, m.groups[last], g.vertexOffset[1], g.firstIndex[1], g.indexCount[1]);
-        else { g.vertexOffset[1] = g.vertexOffset[0]; g.firstIndex[1] = g.firstIndex[0]; g.indexCount[1] = g.indexCount[0]; }
+        if (chain) appendGroup(w, m.groups[last], m.materials, g.vertexOffset[1], g.subs[1]);
+        else { g.vertexOffset[1] = g.vertexOffset[0]; g.subs[1] = g.subs[0]; }
         ok++;
     }
-    printf("map %s: %zu instances, %zu/%zu types decoded, %zu vertices, %zu indices\n", map.c_str(), w.objects.instances.size(), ok,
-           w.objects.types.size(), w.vertices.size() / 3, w.indices.size());
+    printf("map %s: %zu instances, %zu/%zu types decoded, %zu vertices, %zu indices, %zu materials\n", map.c_str(), w.objects.instances.size(), ok,
+           w.objects.types.size(), w.vertices.size() / 5, w.indices.size(), w.mats.size());
 }
 
 // ---------------------------------------------------------------- vulkan helpers
@@ -263,11 +298,11 @@ static VkShaderModule loadShader(Gfx& g, const std::string& path) {
 }
 
 static void imageBarrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
-                         VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
+                         VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess, uint32_t levels = 1) {
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = srcStage; b.srcAccessMask = srcAccess; b.dstStageMask = dstStage; b.dstAccessMask = dstAccess;
     b.oldLayout = from; b.newLayout = to; b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img; b.subresourceRange = {aspect, 0, 1, 0, 1};
+    b.image = img; b.subresourceRange = {aspect, 0, levels, 0, 1};
     VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     d.imageMemoryBarrierCount = 1; d.pImageMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cb, &d);
@@ -275,7 +310,61 @@ static void imageBarrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags asp
 
 // ---------------------------------------------------------------- main
 
-struct Draw { uint32_t indexCount, instanceCount, firstIndex; int32_t vertexOffset; uint32_t firstInstance; };
+// ---------------------------------------------------------------- textures
+
+struct GpuTex { VkImage image{}; VkDeviceMemory mem{}; VkImageView view{}; };
+
+static GpuTex createTexture(Gfx& g, const oc::Texture& tex) {
+    VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    switch (tex.format) {
+        case oc::TexFormat::RGBA8: fmt = VK_FORMAT_R8G8B8A8_UNORM; break;
+        case oc::TexFormat::R8: fmt = VK_FORMAT_R8_UNORM; break;
+        case oc::TexFormat::BC1: fmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK; break;
+        case oc::TexFormat::BC2: fmt = VK_FORMAT_BC2_UNORM_BLOCK; break;
+        case oc::TexFormat::BC3: fmt = VK_FORMAT_BC3_UNORM_BLOCK; break;
+    }
+    GpuTex out;
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {tex.mips[0].w, tex.mips[0].h, 1};
+    ii.mipLevels = (uint32_t)tex.mips.size(); ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK(vkCreateImage(g.dev, &ii, nullptr, &out.image));
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(g.dev, out.image, &mr);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size; ai.memoryTypeIndex = findMem(g, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK(vkAllocateMemory(g.dev, &ai, nullptr, &out.mem));
+    VK(vkBindImageMemory(g.dev, out.image, out.mem, 0));
+    Buf st = makeBuffer(g, tex.data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+    memcpy(st.map, tex.data.data(), tex.data.size());
+    VkCommandBuffer cb = beginOnce(g);
+    uint32_t levels = (uint32_t)tex.mips.size();
+    imageBarrier(cb, out.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, levels);
+    std::vector<VkBufferImageCopy> regions(levels);
+    for (uint32_t i = 0; i < levels; i++) {
+        regions[i] = {};
+        regions[i].bufferOffset = tex.mips[i].offset;
+        regions[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        regions[i].imageExtent = {tex.mips[i].w, tex.mips[i].h, 1};
+    }
+    vkCmdCopyBufferToImage(cb, st.buf, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levels, regions.data());
+    imageBarrier(cb, out.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT, levels);
+    endOnce(g, cb);
+    vkUnmapMemory(g.dev, st.mem);
+    vkDestroyBuffer(g.dev, st.buf, nullptr);
+    vkFreeMemory(g.dev, st.mem, nullptr);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = out.image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt; vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
+    if (tex.format == oc::TexFormat::R8) vi.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
+    VK(vkCreateImageView(g.dev, &vi, nullptr, &out.view));
+    return out;
+}
+
+constexpr uint32_t MAX_TEX = 4096;
+
+struct Draw { uint32_t indexCount, instanceCount, firstIndex; int32_t vertexOffset; uint32_t firstInstance, mat; };
 
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: oc_viewer <DW dir> [map] [--shot out.ppm] [--cam x y z yaw pitch] [--radius R]\n"); return 1; }
@@ -342,11 +431,16 @@ int main(int argc, char** argv) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = g.family; qi.queueCount = 1; qi.pQueuePriorities = &prio;
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12.descriptorIndexing = VK_TRUE; f12.descriptorBindingPartiallyBound = VK_TRUE; f12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    f13.dynamicRendering = VK_TRUE; f13.synchronization2 = VK_TRUE;
+    f13.pNext = &f12; f13.dynamicRendering = VK_TRUE; f13.synchronization2 = VK_TRUE;
+    VkPhysicalDeviceFeatures feats{};
+    feats.samplerAnisotropy = VK_TRUE; feats.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
     const char* devExt[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.pNext = &f13; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qi; dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = devExt;
+    dci.pNext = &f13; dci.pEnabledFeatures = &feats; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qi; dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = devExt;
     VK(vkCreateDevice(g.phys, &dci, nullptr, &g.dev));
     vkGetDeviceQueue(g.dev, g.family, 0, &g.queue);
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -364,23 +458,61 @@ int main(int argc, char** argv) {
         b = makeBuffer(g, std::max<size_t>(maxInst, 1) * sizeof(GpuInstance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
 
+    // texture descriptors: one big array, slot 0 = default gray
+    VkDescriptorSetLayoutBinding dlb{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_TEX, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorBindingFlags dbf = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+    VkDescriptorSetLayoutBindingFlagsCreateInfo dbfi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+    dbfi.bindingCount = 1; dbfi.pBindingFlags = &dbf;
+    VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dlci.pNext = &dbfi; dlci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT; dlci.bindingCount = 1; dlci.pBindings = &dlb;
+    VkDescriptorSetLayout dsl;
+    VK(vkCreateDescriptorSetLayout(g.dev, &dlci, nullptr, &dsl));
+    VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_TEX};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT; dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &dps;
+    VkDescriptorPool dpool;
+    VK(vkCreateDescriptorPool(g.dev, &dpci, nullptr, &dpool));
+    VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool = dpool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &dsl;
+    VkDescriptorSet dset;
+    VK(vkAllocateDescriptorSets(g.dev, &dsai, &dset));
+    VkSamplerCreateInfo sci2{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci2.magFilter = sci2.minFilter = VK_FILTER_LINEAR; sci2.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci2.addressModeU = sci2.addressModeV = sci2.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci2.anisotropyEnable = VK_TRUE; sci2.maxAnisotropy = 8.0f; sci2.maxLod = 16.0f;
+    VkSampler sampler;
+    VK(vkCreateSampler(g.dev, &sci2, nullptr, &sampler));
+    auto setSlot = [&](uint32_t slot, VkImageView view) {
+        VkDescriptorImageInfo di{sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet wds{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wds.dstSet = dset; wds.dstBinding = 0; wds.dstArrayElement = slot; wds.descriptorCount = 1;
+        wds.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wds.pImageInfo = &di;
+        vkUpdateDescriptorSets(g.dev, 1, &wds, 0, nullptr);
+    };
+    {
+        oc::Texture gray;
+        gray.width = gray.height = 1; gray.format = oc::TexFormat::RGBA8; gray.mips = {{1, 1, 0, 4}}; gray.data = {150, 145, 135, 255};
+        setSlot(0, createTexture(g, gray).view);
+    }
+    uint32_t nextSlot = 1;
+
     // pipeline
     std::string exeDir = SDL_GetBasePath();
     VkShaderModule vs = loadShader(g, exeDir + "mesh.vert.spv"), fsm = loadShader(g, exeDir + "mesh.frag.spv");
-    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(glm::mat4) + sizeof(glm::vec4)};
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(glm::mat4) + sizeof(glm::vec4) + 16};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    plci.setLayoutCount = 1; plci.pSetLayouts = &dsl; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
     VkPipelineLayout layout;
     VK(vkCreatePipelineLayout(g.dev, &plci, nullptr, &layout));
     VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fsm; stages[1].pName = "main";
-    VkVertexInputBindingDescription binds[2] = {{0, 12, VK_VERTEX_INPUT_RATE_VERTEX}, {1, sizeof(GpuInstance), VK_VERTEX_INPUT_RATE_INSTANCE}};
-    VkVertexInputAttributeDescription attrs[4] = {
-        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 1, VK_FORMAT_R32G32B32_SFLOAT, 0},
-        {2, 1, VK_FORMAT_R32G32B32_SFLOAT, 16}, {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32}};
+    VkVertexInputBindingDescription binds[2] = {{0, 20, VK_VERTEX_INPUT_RATE_VERTEX}, {1, sizeof(GpuInstance), VK_VERTEX_INPUT_RATE_INSTANCE}};
+    VkVertexInputAttributeDescription attrs[5] = {
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32_SFLOAT, 12},
+        {2, 1, VK_FORMAT_R32G32B32_SFLOAT, 0}, {3, 1, VK_FORMAT_R32G32B32_SFLOAT, 16}, {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32}};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = binds; vi.vertexAttributeDescriptionCount = 4; vi.pVertexAttributeDescriptions = attrs;
+    vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = binds; vi.vertexAttributeDescriptionCount = 5; vi.pVertexAttributeDescriptions = attrs;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -501,7 +633,22 @@ int main(int argc, char** argv) {
             if (!counts[b]) continue;
             const TypeGeom& tg = world.geom[b / 2];
             int lod = (int)(b & 1);
-            draws.push_back({tg.indexCount[lod], counts[b], tg.firstIndex[lod], tg.vertexOffset[lod], starts[b]});
+            for (const Sub& s : tg.subs[lod]) draws.push_back({s.count, counts[b], s.first, tg.vertexOffset[lod], starts[b], s.mat});
+        }
+
+        // stream in a few diffuse textures per frame for materials that are on screen
+        int budget = shot.empty() ? 6 : 400;
+        for (const Draw& d : draws) {
+            MatInfo& m = world.mats[d.mat];
+            if (m.state || budget <= 0 || nextSlot >= MAX_TEX) continue;
+            m.state = 1;
+            auto it = world.textures.find(m.tex);
+            if (m.tex.empty() || it == world.textures.end()) continue;
+            oc::Texture tex;
+            try { if (!oc::loadTexture(*it->second.first, *it->second.second, 1024, tex)) continue; } catch (std::exception&) { continue; }
+            budget--;
+            setSlot(nextSlot, createTexture(g, tex).view);
+            m.slot = (int)nextSlot++;
         }
 
         VkCommandBuffer cmd = cmds[fi];
@@ -527,7 +674,7 @@ int main(int argc, char** argv) {
         VkRect2D sc{{0, 0}, g.extent};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &sc);
-        struct { glm::mat4 vp; glm::vec4 cam; } pc;
+        struct { glm::mat4 vp; glm::vec4 cam; uint32_t tex; uint32_t pad[3]; } pc{};
         glm::mat4 proj = glm::perspective(glm::radians(65.0f), (float)g.extent.width / (float)g.extent.height, 0.3f, radius * 2.0f);
         proj[1][1] *= -1.0f;
         pc.vp = proj * glm::lookAt(camPos, camPos + fwd, glm::vec3(0, 1, 0));
@@ -537,7 +684,12 @@ int main(int argc, char** argv) {
         VkDeviceSize offs[2] = {0, 0};
         vkCmdBindVertexBuffers(cmd, 0, 2, vbs, offs);
         vkCmdBindIndexBuffer(cmd, ibuf.buf, 0, VK_INDEX_TYPE_UINT32);
-        for (const Draw& d : draws) vkCmdDrawIndexed(cmd, d.indexCount, d.instanceCount, d.firstIndex, d.vertexOffset, d.firstInstance);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &dset, 0, nullptr);
+        for (const Draw& d : draws) {
+            pc.tex = (uint32_t)world.mats[d.mat].slot;
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+            vkCmdDrawIndexed(cmd, d.indexCount, d.instanceCount, d.firstIndex, d.vertexOffset, d.firstInstance);
+        }
         vkCmdEndRendering(cmd);
         bool takeShot = !shot.empty() && frame == 8;
         if (takeShot) {
