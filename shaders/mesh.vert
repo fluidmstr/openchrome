@@ -12,6 +12,7 @@ layout(push_constant) uniform PC {
     mat4 viewProj;
     vec4 cam;
     uint tex;
+    uint nrmSpc;  // low 16 bits normal map slot, high 16 specular map slot (0 = none)
 } pc;
 
 layout(location = 0) out vec3 wpos;

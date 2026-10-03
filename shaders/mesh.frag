@@ -23,6 +23,7 @@ layout(push_constant) uniform PC {
     mat4 viewProj;
     vec4 cam;
     uint tex;
+    uint nrmSpc;  // low 16 bits normal map slot, high 16 specular map slot (0 = none)
 } pc;
 
 vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
@@ -60,13 +61,36 @@ vec3 pointLights(vec3 N) {
     return acc * 14.0;
 }
 
+// perturbs N with a DXT5nm normal map (x in alpha, y in green); tangent frame from screen-space derivatives
+vec3 mapNormal(vec3 N, uint slot) {
+    vec4 s = texture(textures[slot], uv);
+    vec2 xy = vec2(s.a, s.g) * 2.0 - 1.0;
+    vec3 n = vec3(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+    vec3 dp1 = dFdx(wpos), dp2 = dFdy(wpos);
+    vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
+    vec3 dp2perp = cross(dp2, N), dp1perp = cross(N, dp1);
+    vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float inv = inversesqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
+    return normalize(mat3(T * inv, B * inv, N) * n);
+}
+
 void main() {
     // meshes without decoded normals fall back to the flat normal from screen-space derivatives
     vec3 N = dot(wnormal, wnormal) > 0.01 ? normalize(wnormal) : normalize(cross(dFdx(wpos), dFdy(wpos)));
-    float ndl = max(dot(N, frame.sunDir.xyz), 0.0) * shadowFactor(N);
+    uint nslot = pc.nrmSpc & 0xffffu, sslot = pc.nrmSpc >> 16;
+    float shadow = shadowFactor(N);
+    if (nslot != 0u) N = mapNormal(N, nslot);
+    float ndl = max(dot(N, frame.sunDir.xyz), 0.0) * shadow;
     vec3 hemi = mix(frame.groundColor.rgb, frame.skyColor.rgb, N.y * 0.5 + 0.5);
     vec3 albedo = pow(texture(textures[pc.tex], uv).rgb, vec3(2.2));
     vec3 col = albedo * (hemi * 0.7 + frame.sunColor.rgb * ndl);
+    if (sslot != 0u) {
+        vec4 sp = texture(textures[sslot], uv);
+        vec3 V = normalize(pc.cam.xyz - wpos), H = normalize(V + frame.sunDir.xyz);
+        float gloss = sp.a, power = 4.0 + gloss * gloss * 120.0;
+        col += pow(sp.rgb, vec3(2.2)) * 4.0 * pow(max(dot(N, H), 0.0), power) * (power + 8.0) / 25.0 * ndl * frame.sunColor.rgb;
+    }
     col += albedo * pointLights(N) * frame.sunColor.w;
     // lit windows / glowing signs after dusk
     col += mix(albedo, vec3(1.0, 0.72, 0.42), 0.55) * emissive * 2.2 * frame.sunColor.w;

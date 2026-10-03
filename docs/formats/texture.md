@@ -18,3 +18,8 @@ Pixel data: the other chunk whose size equals the full mip chain x faces (larges
 Format ids (verified by byte counts and by viewing the output): `2` RGBA8 (4 B/texel), `14` 1 B/texel (R8), `17` BC1, `19` BC3, `33` RGBA32F. `18` is 1 B/texel block-compressed, assumed BC2 (unverified).
 
 `tools/textures.py <pack> <outdir> [filter]` writes DDS (DX10 header). Verified visually: bokeh, clouds_top_a, logo_background.
+
+## Material map conventions (character materials)
+
+- `*_nrm` (BC3): DXT5nm, x in alpha, y in green, z reconstructed. Verified visually (cloth folds, face detail).
+- `*_spc` (BC3): rgb specular colour, alpha gloss (guessed from value statistics and the look).

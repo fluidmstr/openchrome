@@ -46,11 +46,12 @@ struct TypeGeom {
 
 struct GpuInstance { float pos[3], p0, scale[3], p1, quat[4]; };  // 48 bytes
 
-struct MatInfo { std::string name, tex, dyeMask, dyePal; int slot = 0; int state = 0; };  // state: 0 pending, 1 resolved
+struct MatInfo { std::string name, tex, dyeMask, dyePal, nrm, spc; int slot = 0; int state = 0; int nrmSlot = 0, spcSlot = 0; };  // state: 0 pending, 1 resolved
 
 struct Spawn { std::string mesh, clip; float pos[3]; float yaw; std::vector<int> parts; std::map<int, std::string> partMat; };  // --spawn: skinned character in a static pose
 
 struct World {
+    bool rich = false;   // materials created while true also get normal + specular maps (characters)
     bool nomap = false;  // --nomap: only --spawn characters (fast test scene)
     std::vector<Spawn> spawns;
     std::vector<float> vertices;     // x y z u v + packed snorm8 normal (uint32 bits), 6 floats per vertex
@@ -76,10 +77,15 @@ static uint32_t matId(World& w, const std::string& name) {
     auto it = w.matIndex.find(name);
     if (it != w.matIndex.end()) return it->second;
     uint32_t id = (uint32_t)w.mats.size();
-    MatInfo mi{name, w.db ? w.db->diffuse(name, [&](const std::string& n) { return w.textures.count(n) > 0; }) : std::string(), "", "", 0, 0};
+    MatInfo mi{name, w.db ? w.db->diffuse(name, [&](const std::string& n) { return w.textures.count(n) > 0; }) : std::string()};
     if (w.db) {
         mi.dyeMask = w.db->sampler(name, "s_idx"); mi.dyePal = w.db->sampler(name, "s_grd");
         if (!w.textures.count(mi.dyeMask) || !w.textures.count(mi.dyePal)) mi.dyeMask = mi.dyePal = "";
+    }
+    if (w.db && w.rich) {
+        mi.nrm = w.db->sampler(name, "s_nrm_0"); mi.spc = w.db->sampler(name, "s_spc_0");
+        if (!w.textures.count(mi.nrm)) mi.nrm.clear();
+        if (!w.textures.count(mi.spc)) mi.spc.clear();
     }
     w.mats.push_back(mi);
     w.matIndex[name] = id;
@@ -191,7 +197,7 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
         }
     }
     try { w.db = std::make_unique<oc::MaterialDb>((dw / "Data" / "optimized_dx11.mp").string()); } catch (std::exception& ex) { fprintf(stderr, "materials: %s\n", ex.what()); }
-    w.mats.push_back({"", "", "", "", 0, 1});
+    w.mats.push_back({"", "", "", "", "", "", 0, 1});
     // far terrain ("terrain_horizon") meshes are baked in world space and not listed in the .sobj: add them at the origin
     if (!w.nomap) {
         std::string pre1 = map + "_terrain_horizon", pre2 = map == "old_town" ? "ot_terrain_horizon" : std::string("?");
@@ -248,7 +254,9 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
             }
             std::vector<std::string> partMats;
             oc::MeshGroup mg = mergeParts(m, havePose ? &pose : nullptr, s.parts.empty() ? std::vector<int>{0} : s.parts, s.partMat, partMats);
+            w.rich = true;
             appendGroup(w, mg, partMats, g.vertexOffset[0], g.subs[0]);
+            w.rich = false;
             g.vertexOffset[1] = g.vertexOffset[0];
             g.subs[1] = g.subs[0];
             ok++;
@@ -1038,6 +1046,16 @@ int main(int argc, char** argv) {
             }
             setSlot(nextSlot, createTexture(g, tex).view);
             m.slot = (int)nextSlot++;
+            auto extra = [&](const std::string& n, int& slot) {
+                auto e = world.textures.find(n);
+                oc::Texture x;
+                if (n.empty() || e == world.textures.end() || nextSlot >= MAX_TEX) return;
+                try { if (!oc::loadTexture(*e->second.first, *e->second.second, 1024, x)) return; } catch (std::exception&) { return; }
+                setSlot(nextSlot, createTexture(g, x).view);
+                slot = (int)nextSlot++;
+            };
+            extra(m.nrm, m.nrmSlot);
+            extra(m.spc, m.spcSlot);
         }
 
         VkCommandBuffer cmd = cmds[fi];
@@ -1090,7 +1108,7 @@ int main(int argc, char** argv) {
         VkRect2D sc{{0, 0}, g.extent};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &sc);
-        struct { glm::mat4 vp; glm::vec4 cam; uint32_t tex; uint32_t pad[3]; } pc{};
+        struct { glm::mat4 vp; glm::vec4 cam; uint32_t tex; uint32_t nrmSpc; uint32_t pad[2]; } pc{};
         glm::mat4 proj = glm::perspective(glm::radians(65.0f), (float)g.extent.width / (float)g.extent.height, 0.3f, std::max(radius * 2.0f, 20000.0f));
         proj[1][1] *= -1.0f;
         pc.vp = proj * glm::lookAt(camPos, camPos + fwd, glm::vec3(0, 1, 0));
@@ -1105,6 +1123,7 @@ int main(int argc, char** argv) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &dset1, 1, &uboOff);
         for (const Draw& d : draws) {
             pc.tex = (uint32_t)world.mats[d.mat].slot;
+            pc.nrmSpc = (uint32_t)world.mats[d.mat].nrmSlot | (uint32_t)world.mats[d.mat].spcSlot << 16;
             vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
             vkCmdDrawIndexed(cmd, d.indexCount, d.instanceCount, d.firstIndex, d.vertexOffset, d.firstInstance);
         }
