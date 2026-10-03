@@ -41,3 +41,7 @@ Verified:
 - Stream block = 16-byte header (8 u16) + N rows of 16 bytes; a row holds one u16 per animated channel (lane = channel within its group of 8, unused lanes zero). N varies per block (4, 5, 5, 3).
 
 Rejected: bit-plane decoding of the rows (rows as bit planes of 16 frames) gives noisy values; rows as raw u16 samples scaled by `2e-5` leave the quaternion range. Open: meaning of the block header words (`f4fe 8301 33ff 3480 4380 4380 3380 3380`), and whether rows are spline control points or delta/entropy coded samples. A second clip with a single animated channel is the next best probe.
+
+### Second probe: `lp_air_fatin_forced_14` (97 frames, 118 bones, 2 animated channels)
+
+Same layout; block offsets 280, 284, 287, 292, 296, 301, 306, 309 (16-byte units, 8 blocks of about 12 frames), block sizes 4, 3, 5, 4, 5, 5, 3 rows. Observations that hold for both probes: the first 16 bytes of a block are 8 u16 lanes where lanes `0..animated-1` carry one value per animated channel (e.g. `f400 4400`) and the unused lanes hold `0x80xx` words; the rows after the header use only the first `animated` lanes and the other lanes are zero. Not working: raw u16 samples, bit planes of a row, 2..12 bit packing of the used bytes (smoothness test on `m_fpp_lowstamina` block 0). The per-channel header values and the `0x80xx` words are probably a per-block range or bit-width table; decoding needs a clip with a known motion (a looping idle where the same value must return at the loop point).
