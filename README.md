@@ -7,7 +7,7 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6).
 **Status:** early reverse engineering of file formats.
 
 - [x] `.rpack` container ([spec](docs/formats/rpack.md), `tools/rpack.py`)
-- [ ] name/record mapping, file extraction
+- [x] resource names, per-resource extraction
 - [ ] meshes, materials, textures
 - [ ] map loading + free camera
 - [ ] gameplay

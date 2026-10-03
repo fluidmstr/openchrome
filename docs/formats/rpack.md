@@ -1,36 +1,49 @@
 # .rpack (RP6L) container
 
-Observed on `DW/Data/*.rpack` of the Steam build; all fields little-endian. Derived from the files themselves (offset chains, sizes that tile the file exactly, zlib round-trips).
+Observed on `DW/Data/*.rpack` of the Steam build; all fields little-endian. Derived from the files themselves (offset chains, sizes that tile the file exactly, zlib round-trips). 38 of the smaller packs parse with one out-of-bounds chunk (`static_load_PC`, loading_prison, part id with bit 8 set).
 
-## Header (32 bytes)
+## Layout
+
+```
+header            32 bytes
+stream table      nStreams x 20
+record table      nRecords x 16
+resource dir      nRes x 12
+name offsets      (nRes+1) x u32
+string table      strSize bytes (NUL-terminated, latin1)
+stream payloads   (offsets from the stream table; tile the rest of the file)
+```
+
+### Header
 
 | off | type | meaning |
 |----|----|----|
 | 0 | u32 | magic `RP6L` (0x4c365052) |
 | 4 | u32 | version = 1 |
 | 8 | u32 | 1 (unknown) |
-| 12 | u32 | total resource-record count (unverified) |
-| 16 | u32 | number of streams |
-| 20.. | u32 x3 | counts / sizes, not yet decoded |
+| 12 | u32 | nRecords |
+| 16 | u32 | nStreams |
+| 20 | u32 | nRes |
+| 24 | u32 | strSize |
+| 28 | u32 | nRes (again) |
 
-## Stream table (at 32, `streams` x 20 bytes)
+### Stream table: `[x][flags][offset][usize][csize]`
 
-`[x][flags][offset][usize][csize]`
+- `csize != 0`: one zlib stream (78 xx) of `usize` bytes at `offset`; `csize == 0`: stored raw.
+- `flags` low byte = stream role (0x10.. 0x22 resource data, 0xf0.. 0xf8, 0xff = name registry text). Per-role meaning: TODO.
 
-- `csize != 0`: payload at `offset` is one zlib stream (78 xx header) of `usize` bytes.
-- `csize == 0`: stored raw, `usize` bytes.
-- Streams tile the tail of the file: `offset + csize` of one equals `offset` of the next, last ends at EOF.
-- Verified: `common_anims_PC` stream 0 (213 MB compressed) inflates to exactly `usize` = 0x102097c0 as a single zlib stream; `engine_PC` has 9 streams, all inflate to `usize`.
-- `flags` low byte = stream kind (e.g. 0x10-0x22 resource data, 0xf0/0xf1, 0xff = text name list, raw). Meaning of each kind: TODO.
+### Record table: `[flags][id][offset][size]`
 
-## Record table (after the stream table)
+`id = resIndex<<16 | partId`; `partId & 0xff` is the stream index, the data is `stream[offset:offset+size]`. Bit 8 of `partId` appears on some chunks (meaning unknown). `flags` is nonzero only on the first row (unknown).
 
-16-byte rows `[0][id][offset][size]`, `id = index<<16 | part`. `offset/size` address the inflated stream selected by `part` (0, 1, 2 seen); within a part the rows are contiguous (`offset+size` = next offset). Exact start/count and the tail index tables are still to be decoded.
+### Resource dir: `[firstRecordRow][typeFlags][resIndex]`
 
-## Name list
+Seen type flags (count over 38 packs): `0x01400001` 10318, `0x01100005` 5254 (meshes: names listed in `_MESH_`), `0x01420002` 3069, `0x21200002` 836 and `0x21200003` 703 (textures), `0x81ff0001` 129 (name registries `_MATERIAL_`, `_TEXTURE_`, `_MESH_` with `+name` text lists), `0x01500001` 29, `0x01f80001` 18, `0x01f80003` 9, `0x01100003` 2.
 
-Last stream (raw, `\n`-separated, prefix `+`), e.g. `+add_blinn&0000` (shaders in engine_PC), `+_calm_r_s_boxjumpdown2` (anims). Mapping name -> record not yet established.
+### Names
+
+`nameOffsets[0]` is a pack-level name; resource `i` is `string[nameOffsets[i+1]]`.
 
 ## Tool
 
-`tools/rpack.py <file> [outdir]` dumps every inflated stream.
+`tools/rpack.py ls <pack>` lists resources and per-stream sizes; `tools/rpack.py x <pack> <dir>` extracts the parts.
