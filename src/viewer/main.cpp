@@ -970,6 +970,7 @@ int main(int argc, char** argv) {
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_RIGHTBRACKET) hour = std::fmod(hour + 0.5f, 24.0f);
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_LEFTBRACKET) hour = std::fmod(hour + 23.5f, 24.0f);
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_p) printf("--cam %.2f %.2f %.2f %.3f %.3f\n", camPos.x, camPos.y, camPos.z, yaw, pitch), fflush(stdout);
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_n) hour = (hour > 7.0f && hour < 18.0f) ? 22.0f : 14.0f;
             else if (e.type == SDL_MOUSEMOTION && SDL_GetRelativeMouseMode()) { yaw += e.motion.xrel * 0.0025f; pitch = std::clamp(pitch - e.motion.yrel * 0.0025f, -1.55f, 1.55f); }
             else if (e.type == SDL_MOUSEWHEEL) speed = std::clamp(speed * (e.wheel.y > 0 ? 1.25f : 0.8f), 2.0f, 2000.0f);
