@@ -50,7 +50,7 @@ build\oc_viewer.exe "F:\SteamLibrary\steamapps\common\Dying Light\DW" old_town
 ```
 
 Controls: WASD fly, mouse look, Q/E down/up, Shift/Ctrl speed, wheel changes speed, `[` `]` shift the time of day, `N` toggles day/night, Esc quits.
-Options: `--time H` hour of day, `--radius R` draw distance, `--shot out.ppm --cam x y z yaw pitch` write a screenshot and exit, `--spawn mesh clip x y z yaw` and `--parts`, `--nomap` for character tests. `oc_probe` decodes all meshes of a map as a smoke test.
+Options: `--time H` hour of day, `--radius R` draw distance, `--shot out.ppm --cam x y z yaw pitch` write a screenshot and exit, `--spawn mesh clip x y z yaw` and `--parts`, `--item id x y z yaw` (inventory item by script id, mesh resolved through the item scripts), `--nomap` for character and item tests. `oc_probe` decodes all meshes of a map as a smoke test.
 
 Research tools live in `tools/` (Python, numpy/Pillow): unpack containers, export textures and models, inspect clips and skeletons. Format notes are in [`docs/formats/`](docs/formats/).
 

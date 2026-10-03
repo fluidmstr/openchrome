@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "core/exp.hpp"
+#include "core/items.hpp"
 #include "core/mesh.hpp"
 #include "core/mp.hpp"
 #include "core/texture.hpp"
@@ -48,12 +49,15 @@ struct GpuInstance { float pos[3], p0, scale[3], p1, quat[4]; };  // 48 bytes
 
 struct MatInfo { std::string name, tex, dyeMask, dyePal, nrm, spc; int slot = 0; int state = 0; int nrmSlot = 0, spcSlot = 0; };  // state: 0 pending, 1 resolved
 
+struct ItemSpawn { std::string id; float pos[3]; float yaw; };  // --item: inventory item mesh by id
+
 struct Spawn { std::string mesh, clip; float pos[3]; float yaw; std::vector<int> parts; std::map<int, std::string> partMat; };  // --spawn: skinned character in a static pose
 
 struct World {
     bool rich = false;   // materials created while true also get normal + specular maps (characters)
     bool nomap = false;  // --nomap: only --spawn characters (fast test scene)
     std::vector<Spawn> spawns;
+    std::vector<ItemSpawn> itemSpawns;
     std::vector<float> vertices;     // x y z u v + packed snorm8 normal (uint32 bits), 6 floats per vertex
     std::vector<uint32_t> indices;
     std::vector<TypeGeom> geom;      // per object type
@@ -172,6 +176,36 @@ static oc::MeshGroup mergeParts(const oc::Mesh& m, const oc::Pose* pose, const s
     return out;
 }
 
+// Mesh name of an inventory item (own, or inherited through the chain of base items); empty if unknown.
+static std::string itemMesh(const fs::path& dw, const std::vector<std::string>& ids, std::map<std::string, std::string>& out) {
+    std::map<std::string, oc::ItemDef> defs;
+    for (auto& e : fs::directory_iterator(dw)) {
+        std::string p = e.path().string();
+        if (e.path().extension() != ".pak" || e.path().filename().string().rfind("Data", 0) != 0) continue;
+        for (auto& name : oc::listZip(p)) {
+            if (name.rfind("data/scripts/", 0) != 0 || name.size() < 4 || name.substr(name.size() - 4) != ".scr") continue;
+            std::vector<uint8_t> b;
+            if (!oc::readZipEntry(p, name, b) || b.empty() || b[0] == 0xff) continue;
+            std::vector<oc::ItemDef> items;
+            oc::collectItems(oc::parseScript(std::string(b.begin(), b.end())), items);
+            for (auto& it : items) {
+                auto f = defs.find(it.id);
+                if (f == defs.end() || (!f->second.first("Mesh") && it.first("Mesh"))) defs[it.id] = it;
+            }
+        }
+    }
+    for (auto& id : ids) {
+        std::string cur = id;
+        for (int hop = 0; hop < 8 && defs.count(cur); hop++) {
+            const oc::ItemDef& d = defs[cur];
+            if (const oc::ScrValue* m = d.first("Mesh")) { out[id] = m->text; break; }
+            if (d.base.empty()) break;
+            cur = d.base;
+        }
+    }
+    return {};
+}
+
 static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
     std::vector<uint8_t> blob;
     if (!oc::readZipEntry((dw / "Data2.pak").string(), "data/maps/" + map + "/" + map + ".sobj", blob)) {
@@ -207,6 +241,26 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
             in.scale[0] = in.scale[1] = in.scale[2] = 1.0f; in.quat[3] = 32767; in.tag = 0xffff;
             in.type = (uint16_t)w.objects.types.size();
             w.objects.types.push_back({kv.first + ".msh", "Default", "", 0});
+            w.objects.instances.push_back(in);
+        }
+    }
+    if (!w.itemSpawns.empty()) {
+        std::vector<std::string> ids;
+        for (auto& s : w.itemSpawns) ids.push_back(s.id);
+        std::map<std::string, std::string> meshOf;
+        itemMesh(dw, ids, meshOf);
+        for (auto& s : w.itemSpawns) {
+            auto m = meshOf.find(s.id);
+            if (m == meshOf.end()) { fprintf(stderr, "item %s: no mesh found\n", s.id.c_str()); continue; }
+            printf("item %s: mesh %s\n", s.id.c_str(), m->second.c_str());
+            oc::Instance in{};
+            in.scale[0] = in.scale[1] = in.scale[2] = 1.0f;
+            float h = s.yaw * 3.14159265f / 360.0f;
+            in.quat[1] = (int16_t)std::lround(std::sin(h) * 32767); in.quat[3] = (int16_t)std::lround(std::cos(h) * 32767);
+            memcpy(in.pos, s.pos, 12);
+            in.tag = 0xffff;
+            in.type = (uint16_t)w.objects.types.size();
+            w.objects.types.push_back({m->second, "Default", "", 0});
             w.objects.instances.push_back(in);
         }
     }
@@ -537,6 +591,7 @@ int main(int argc, char** argv) {
         if (a == "--shot" && i + 1 < argc) shot = argv[++i];
         else if (a == "--radius" && i + 1 < argc) radius = (float)atof(argv[++i]);
         else if (a == "--spawn" && i + 6 < argc) { world.spawns.push_back({argv[i + 1], argv[i + 2], {(float)atof(argv[i + 3]), (float)atof(argv[i + 4]), (float)atof(argv[i + 5])}, (float)atof(argv[i + 6])}); i += 6; }
+        else if (a == "--item" && i + 5 < argc) { world.itemSpawns.push_back({argv[i + 1], {(float)atof(argv[i + 2]), (float)atof(argv[i + 3]), (float)atof(argv[i + 4])}, (float)atof(argv[i + 5])}); i += 5; }
         else if (a == "--nomap") world.nomap = true;
         else if (a == "--parts" && i + 1 < argc && !world.spawns.empty()) {
             // list of part[=material.mat]
