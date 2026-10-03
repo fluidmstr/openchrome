@@ -1,0 +1,9 @@
+.claude/
+.kasper/
+CLAUDE.md
+TODO.md
+PROJECT.md
+__pycache__/
+*.rpack
+*.csb
+out/
