@@ -34,3 +34,13 @@ Blob = NUL-terminated name (`*.mat`, `*.dds`, shader parameter names...). `key` 
 Texture refs are found by looking every word up in `strings` (names ending `.dds`; the rpack texture resource name is the same without `.dds`). `flags` byte 2 (0x83..0x86) is a slot id whose meaning depends on the template (e.g. 0x84 is mostly a normal map, 0x85 spec/diffuse), so diffuse is picked by name (`_nrm/_spc/_msk...` excluded). 87% of the 130k texture references resolve to a texture in `DW/Data/*.rpack`.
 
 Tools: `tools/mp.py` (reader), `tools/materials.py` (materials, texture index, classification), `tools/export_model.py <pack> <mesh> <out>` (OBJ + MTL + PNG).
+
+## Albedo selection (heuristic, C++ `MaterialDb::diffuse`)
+
+Material templates (`templates_*`, hashes of parameter names) are not decoded, so the albedo is chosen by name:
+1. among the listed textures, `*_dif/_diff/_clr/_color/_d` score highest; names with normal/spec/mask/height/`dye` tokens or `blood/wind/weave/noise/overlay/dirt/env` score low;
+2. if nothing scores >= 0, the albedo is derived from the base name of a spec, then normal, then mask map (`plaster_ot_a_spc` -> `plaster_ot_a`, `ot_atlas_nrm_a` -> `ot_atlas_a`) when such a texture exists. This is what colours the Old Town facades: their materials only list `*_dye` (a per-mesh grayscale mask, not a colour map) plus normal/spec maps of shared tiling textures;
+3. otherwise the material has no albedo (default gray).
+
+Open: the real blend of the tiling layers and the `dye` tint, car paint (green fringes on cars).
+

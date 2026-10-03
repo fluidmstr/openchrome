@@ -73,20 +73,53 @@ MaterialDb::MaterialDb(const std::string& path) {
     rows(secs["materials"], [&](uint32_t key, uint32_t off, uint32_t sz) { blobs_[key] = {off, sz}; });
 }
 
-std::string MaterialDb::diffuse(const std::string& mat) const {
+namespace {
+// "ot_brick_e_nrm" -> "ot_brick_e", "ot_atlas_nrm_a" -> "ot_atlas_a": the albedo shares the base name of its normal/spec map.
+bool baseName(const std::string& name, const char* tok, std::string& out) {
+    std::string l = name;
+    for (auto& c : l) c = (char)tolower((unsigned char)c);
+    std::vector<std::string> parts;
+    for (size_t b = 0; b <= l.size();) {
+        size_t e = l.find('_', b);
+        if (e == std::string::npos) e = l.size();
+        parts.push_back(l.substr(b, e - b));
+        b = e + 1;
+    }
+    for (size_t i = 1; i < parts.size(); i++) {
+        if (parts[i] != tok) continue;
+        out.clear();
+        for (size_t k = 0; k < parts.size(); k++) if (k != i) out += (out.empty() ? "" : "_") + parts[k];
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+std::string MaterialDb::diffuse(const std::string& mat, const std::function<bool(const std::string&)>& exists) const {
     auto k = matKey_.find(mat);
     if (k == matKey_.end()) return {};
     auto b = blobs_.find(k->second);
     if (b == blobs_.end()) return {};
-    std::string best;
-    int bestScore = -1000;
+    std::vector<std::string> names;
     for (uint32_t o = b->second.first + 40; o + 4 <= b->second.first + b->second.second; o += 4) {
         auto t = dds_.find(rd<uint32_t>(&file_[o]));
-        if (t == dds_.end()) continue;
-        int s = diffuseScore(t->second);
-        if (s > bestScore) { bestScore = s; best = t->second; }
+        if (t != dds_.end()) names.push_back(t->second);
     }
-    return bestScore <= -20 ? std::string() : best;  // only maps / normals: no albedo
+    std::string best;
+    int bestScore = -1000;
+    for (auto& n : names) {
+        int s = diffuseScore(n);
+        if (s > bestScore) { bestScore = s; best = n; }
+    }
+    if (bestScore >= 0 && exists(best)) return best;
+    // no albedo listed: derive it from spec, then normal, then mask names
+    for (const char* tok : {"spc", "shn", "nrm", "msk"}) {
+        for (auto& n : names) {
+            std::string base;
+            if (baseName(n, tok, base) && exists(base)) return base;
+        }
+    }
+    return bestScore > -20 && exists(best) ? best : std::string();
 }
 
 }  // namespace oc

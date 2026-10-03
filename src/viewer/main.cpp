@@ -69,7 +69,7 @@ static uint32_t matId(World& w, const std::string& name) {
     auto it = w.matIndex.find(name);
     if (it != w.matIndex.end()) return it->second;
     uint32_t id = (uint32_t)w.mats.size();
-    w.mats.push_back({name, w.db ? w.db->diffuse(name) : std::string(), 0, 0});
+    w.mats.push_back({name, w.db ? w.db->diffuse(name, [&](const std::string& n) { return w.textures.count(n) > 0; }) : std::string(), 0, 0});
     w.matIndex[name] = id;
     return id;
 }
