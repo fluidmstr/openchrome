@@ -2,8 +2,10 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace oc {
@@ -21,6 +23,11 @@ private:
     std::unordered_map<uint32_t, std::string> dds_;                  // string key -> texture resource name
     std::unordered_map<std::string, uint32_t> matKey_;                // .mat name -> key
     std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> blobs_;  // material key -> offset,size
+    std::unordered_map<uint32_t, std::string> samplerName_;           // string key -> "s_*" shader sampler name
+    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> templates_;  // template key -> offset,size
+    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> samplers_;  // hl shader key -> (sampler key, flags)
+    // texture bound to the first existing sampler among `names` (see docs/formats/mp.md), empty if not found
+    std::string bound(const std::vector<uint8_t>& blob, std::initializer_list<const char*> names) const;
 };
 
 }  // namespace oc

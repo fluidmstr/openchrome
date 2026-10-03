@@ -29,7 +29,7 @@ Blob = NUL-terminated name (`*.mat`, `*.dds`, shader parameter names...). `key` 
 | 3 | 1 |
 | 4 | `nTex << 16 \| 2` (record count is unreliable, ~40% of blobs differ) |
 | 5..9 | `0x00120004, 0x10000000, 0, 0x10000000, 0` |
-| 10.. | slot records `[flags][texture-name hash][arg]` |
+| 8.. | slot records `[flags][texture-name hash][1]` (3 words each; the flags byte 2 is a texture format class, not a role) |
 
 Texture refs are found by looking every word up in `strings` (names ending `.dds`; the rpack texture resource name is the same without `.dds`). `flags` byte 2 (0x83..0x86) is a slot id whose meaning depends on the template (e.g. 0x84 is mostly a normal map, 0x85 spec/diffuse), so diffuse is picked by name (`_nrm/_spc/_msk...` excluded). 87% of the 130k texture references resolve to a texture in `DW/Data/*.rpack`.
 
@@ -44,3 +44,10 @@ Material templates (`templates_*`, hashes of parameter names) are not decoded, s
 
 Open: the real blend of the tiling layers and the `dye` tint, car paint (green fringes on cars).
 
+
+## Templates and sampler binding (verified)
+
+`words[2]` of a material is a key in the `templates_*` sections (the same key may appear in several: pass variants; the first one found is used). A template is a list of descriptor keys (`pass_states`, `blend_states`, `hl_shaders`, `expressions`). `hl_shaders` blobs of pixel shaders contain `[sampler name key][flags]` pairs (names are `s_dif_0`, `s_nrm_0`, `s_spc_0`, `s_dye`, `s_clr`, ... in `strings`; bytecode itself is DXBC in `shaders_t`).
+
+Binding: the material's slot records are in ascending order of `flags & 0xfff` of the template's samplers (flags with bits 0xf000 set are global samplers, skipped). Record *i* is the texture of sampler *i*. In 90% of materials the counts match; the rest (extra global samplers) fall back to the name heuristic.
+Albedo = texture bound to `s_dif_0`, else `s_clr`, `s_dif`, `s_det_clr_0` (`MaterialDb::bound`). Terrain blends use `s_dif_0..2` (layers) + `s_nrm_*`/`s_spc_*`; blend weights come from elsewhere (vertex colour / `_t2mat.scr`), not decoded.

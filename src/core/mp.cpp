@@ -69,8 +69,46 @@ MaterialDb::MaterialDb(const std::string& path) {
         std::string s((const char*)&file_[off], strnlen((const char*)&file_[off], sz));
         if (endsWith(s, ".dds")) dds_[key] = s.substr(0, s.size() - 4);
         else if (endsWith(s, ".mat")) matKey_[s] = key;
+        else if (s.compare(0, 2, "s_") == 0) samplerName_[key] = s;
     });
     rows(secs["materials"], [&](uint32_t key, uint32_t off, uint32_t sz) { blobs_[key] = {off, sz}; });
+    for (auto& [name, sec] : secs) {
+        if (name.compare(0, 9, "templates") == 0) rows(sec, [&](uint32_t key, uint32_t off, uint32_t sz) { templates_.emplace(key, std::make_pair(off, sz)); });
+    }
+    // pixel shader descriptors list their samplers as [name key][flags]; flags & 0xfff gives the binding order
+    if (secs.count("hl_shaders")) rows(secs["hl_shaders"], [&](uint32_t key, uint32_t off, uint32_t sz) {
+        if (off + sz > file_.size()) return;
+        auto& v = samplers_[key];
+        for (uint32_t o = off; o + 8 <= off + sz; o += 4) {
+            uint32_t flags = rd<uint32_t>(&file_[o + 4]);
+            if (samplerName_.count(rd<uint32_t>(&file_[o])) && !(flags & 0xf000)) v.push_back({rd<uint32_t>(&file_[o]), flags});
+        }
+    });
+}
+
+// Material blob: 8 header words, then 3-word records [flags][texture key][1], one per sampler of the template's
+// pixel shader, in ascending (sampler flags & 0xfff) order.
+std::string MaterialDb::bound(const std::vector<uint8_t>& blob, std::initializer_list<const char*> names) const {
+    if (blob.size() < 36) return {};
+    auto t = templates_.find(rd<uint32_t>(&blob[8]));
+    if (t == templates_.end()) return {};
+    std::vector<std::pair<uint32_t, uint32_t>> ss;  // (flags, name key)
+    for (uint32_t o = t->second.first; o + 4 <= t->second.first + t->second.second; o += 4) {
+        auto h = samplers_.find(rd<uint32_t>(&file_[o]));
+        if (h == samplers_.end()) continue;
+        for (auto& s : h->second) ss.push_back({s.second & 0xfff, s.first});
+    }
+    std::stable_sort(ss.begin(), ss.end(), [](auto& a, auto& b) { return a.first < b.first; });
+    size_t nrec = (blob.size() / 4 - 8) / 3;
+    if (ss.size() != nrec) return {};
+    for (auto want : names) {
+        for (size_t i = 0; i < nrec; i++) {
+            if (samplerName_.at(ss[i].second) != want) continue;
+            auto d = dds_.find(rd<uint32_t>(&blob[(8 + 3 * i + 1) * 4]));
+            if (d != dds_.end()) return d->second;
+        }
+    }
+    return {};
 }
 
 namespace {
@@ -100,6 +138,11 @@ std::string MaterialDb::diffuse(const std::string& mat, const std::function<bool
     if (k == matKey_.end()) return {};
     auto b = blobs_.find(k->second);
     if (b == blobs_.end()) return {};
+    if (b->second.first + b->second.second <= file_.size()) {
+        std::vector<uint8_t> blob(file_.begin() + b->second.first, file_.begin() + b->second.first + b->second.second);
+        std::string d = bound(blob, {"s_dif_0", "s_clr", "s_dif", "s_det_clr_0"});
+        if (!d.empty() && exists(d)) return d;
+    }
     std::vector<std::string> names;
     for (uint32_t o = b->second.first + 40; o + 4 <= b->second.first + b->second.second; o += 4) {
         auto t = dds_.find(rd<uint32_t>(&file_[o]));
