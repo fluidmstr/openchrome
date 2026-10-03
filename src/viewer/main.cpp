@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "core/exp.hpp"
+#include "core/fsb.hpp"
 #include "core/items.hpp"
 #include "core/mesh.hpp"
 #include "core/mp.hpp"
@@ -604,7 +605,7 @@ int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: oc_viewer <DW dir> [map] [--shot out.ppm] [--cam x y z yaw pitch] [--radius R]\n"); return 1; }
     fs::path dw = argv[1];
     World world;
-    std::string map = "old_town", shot;
+    std::string map = "old_town", shot, music;
     bool startWalk = false;
     glm::vec3 camPos(300, 70, 100);
     float yaw = 0.0f, pitch = -0.25f, radius = 450.0f, hour = 15.0f;
@@ -616,6 +617,7 @@ int main(int argc, char** argv) {
         else if (a == "--spawn" && i + 6 < argc) { world.spawns.push_back({argv[i + 1], argv[i + 2], {(float)atof(argv[i + 3]), (float)atof(argv[i + 4]), (float)atof(argv[i + 5])}, (float)atof(argv[i + 6])}); i += 6; }
         else if (a == "--item" && i + 5 < argc) { world.itemSpawns.push_back({argv[i + 1], {(float)atof(argv[i + 2]), (float)atof(argv[i + 3]), (float)atof(argv[i + 4])}, (float)atof(argv[i + 5])}); i += 5; }
         else if (a == "--nomap") world.nomap = true;
+        else if (a == "--music" && i + 1 < argc) music = argv[++i];
         else if (a == "--parts" && i + 1 < argc && !world.spawns.empty()) {
             // list of part[=material.mat]
             for (char* tok = strtok(argv[++i], ","); tok; tok = strtok(nullptr, ",")) {
@@ -631,7 +633,24 @@ int main(int argc, char** argv) {
 
     loadWorld(dw, map, world);
 
-    SDL_Init(SDL_INIT_VIDEO);
+    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+    // --music <name>: a music track from Data/music_*.csb (IMA ADPCM), looped through an SDL audio queue
+    SDL_AudioDeviceID audio = 0;
+    std::vector<int16_t> musicPcm;
+    if (!music.empty()) {
+        for (auto& de : fs::directory_iterator(fs::path(dw) / "Data")) {
+            if (de.path().extension() != ".csb" || !musicPcm.empty()) continue;
+            for (auto& se : oc::listSounds(de.path().string()))
+                if (se.name == music && oc::decodeSound(de.path().string(), se, musicPcm)) {
+                    SDL_AudioSpec want{}, have{};
+                    want.freq = se.rate; want.format = AUDIO_S16SYS; want.channels = (Uint8)se.channels; want.samples = 4096;
+                    audio = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+                    break;
+                }
+        }
+        if (audio) SDL_PauseAudioDevice(audio, 0);
+        else fprintf(stderr, "music %s not found or not decodable\n", music.c_str());
+    }
     Gfx g;
     g.window = SDL_CreateWindow("openchrome", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!g.window) { fprintf(stderr, "window: %s\n", SDL_GetError()); return 2; }
@@ -1025,6 +1044,7 @@ int main(int argc, char** argv) {
             else if (e.type == SDL_MOUSEWHEEL) speed = std::clamp(speed * (e.wheel.y > 0 ? 1.25f : 0.8f), 2.0f, 2000.0f);
             else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) resized = true;
         }
+        if (audio && SDL_GetQueuedAudioSize(audio) < 1u << 18) SDL_QueueAudio(audio, musicPcm.data(), (Uint32)(musicPcm.size() * 2));
         uint64_t now = SDL_GetPerformanceCounter();
         float dt = shot.empty() ? (float)((double)(now - last) / (double)SDL_GetPerformanceFrequency()) : 1.0f / 60.0f;
         last = now;

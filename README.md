@@ -28,7 +28,9 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6), wri
 | Animation tracks (bit-packed ANM2 streams) | in progress |
 | Procedural sky (gradient, sun, night stars) | done (not the game's own sky) |
 | Terrain layer blending (vertex weights, world-space tiling), alpha-tested foliage | working |
-| Vegetation `.to`, navmesh, gameplay | open |
+| Sound banks (FSB5): listing, IMA ADPCM music playback | working, [spec](docs/formats/audio.md) |
+| Walk mode with gravity and collision against the meshes | working (stand-in for PhysX) |
+| FMOD Vorbis effects, vegetation `.to`, navmesh, gameplay | open |
 
 <img src="docs/img/characters.jpg" align="right" width="42%" alt="Textured character in bind pose and in a clip pose">
 
@@ -52,7 +54,7 @@ build\oc_viewer.exe "F:\SteamLibrary\steamapps\common\Dying Light\DW" old_town
 ```
 
 Controls: WASD fly, mouse look, Q/E down/up, Shift/Ctrl speed, wheel changes speed, `[` `]` shift the time of day, `N` toggles day/night, Esc quits.
-Options: `--time H` hour of day, `--radius R` draw distance, `--shot out.ppm --cam x y z yaw pitch` write a screenshot and exit, `--spawn mesh clip x y z yaw` and `--parts`, `--item id x y z yaw` (inventory item by script id, mesh resolved through the item scripts), `--nomap` for character and item tests, `--walk` starts in walk mode (with `--shot` it settles for 300 frames and prints the camera). `oc_probe` decodes all meshes of a map as a smoke test.
+Options: `--time H` hour of day, `--radius R` draw distance, `--shot out.ppm --cam x y z yaw pitch` write a screenshot and exit, `--spawn mesh clip x y z yaw` and `--parts`, `--item id x y z yaw` (inventory item by script id, mesh resolved through the item scripts), `--nomap` for character and item tests, `--music <name>` plays a track from `Data/music_*.csb` (looped), `--walk` starts in walk mode (with `--shot` it settles for 300 frames and prints the camera). `oc_probe` decodes all meshes of a map as a smoke test.
 
 Research tools live in `tools/` (Python, numpy/Pillow): unpack containers, export textures and models, inspect clips and skeletons. Format notes are in [`docs/formats/`](docs/formats/).
 
