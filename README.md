@@ -10,7 +10,8 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6).
 - [x] resource names, per-resource extraction
 - [x] textures -> DDS ([spec](docs/formats/texture.md), `tools/textures.py`)
 - [x] static meshes -> OBJ ([spec](docs/formats/mesh.md), `tools/mesh.py`)
-- [ ] materials (.mat), skeletons/animations
+- [x] materials + texture binding ([spec](docs/formats/mp.md), `tools/export_model.py`)
+- [ ] skeletons/animations
 - [ ] map loading + free camera
 - [ ] gameplay
 
