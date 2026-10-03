@@ -26,7 +26,7 @@ if((DEFINED ENV{VULKAN_SDK} OR EXISTS "C:/VulkanSDK") AND EXISTS "${CMAKE_SOURCE
     list(GET _sdk -1 VK_SDK)
   endif()
   add_executable(oc_viewer src/viewer/main.cpp)
-  target_include_directories(oc_viewer PRIVATE "${VK_SDK}/Include" "${VK_SDK}/Include/SDL2" "${VK_SDK}/Include/glm")
+  target_include_directories(oc_viewer PRIVATE "${VK_SDK}/Include" "${VK_SDK}/Include/SDL2")
   target_link_directories(oc_viewer PRIVATE "${VK_SDK}/Lib")
   target_link_libraries(oc_viewer oc_core vulkan-1 SDL2 SDL2main)
   find_program(GLSLC glslc HINTS "${VK_SDK}/Bin")

@@ -1,0 +1,594 @@
+// oc_viewer <DW dir> [map] [--shot out.ppm] [--cam x y z yaw pitch] [--radius R]
+// Free-camera viewer for a map's static objects (SDL2 + Vulkan 1.3, flat shaded, no textures yet).
+#include <SDL.h>
+#include <SDL_vulkan.h>
+#include <vulkan/vulkan.h>
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "core/mesh.hpp"
+#include "core/rpack.hpp"
+#include "core/sobj.hpp"
+#include "core/zip.hpp"
+
+namespace fs = std::filesystem;
+
+#define VK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { fprintf(stderr, "%s failed: %d (%s:%d)\n", #x, (int)r_, __FILE__, __LINE__); exit(2); } } while (0)
+
+// ---------------------------------------------------------------- world data
+
+struct TypeGeom {
+    bool valid = false;
+    int32_t vertexOffset[2] = {0, 0};
+    uint32_t firstIndex[2] = {0, 0}, indexCount[2] = {0, 0};
+};
+
+struct GpuInstance { float pos[3], p0, scale[3], p1, quat[4]; };  // 48 bytes
+
+struct World {
+    std::vector<float> vertices;     // xyz
+    std::vector<uint32_t> indices;
+    std::vector<TypeGeom> geom;      // per object type
+    oc::StaticObjects objects;
+};
+
+static bool skipType(const std::string& mesh) {
+    static const char* skip[] = {"blood", "decal", "dummy", "dead_body", "trigger", "collision", "physics"};
+    std::string l = mesh;
+    for (auto& c : l) c = (char)tolower((unsigned char)c);
+    for (auto s : skip) if (l.find(s) != std::string::npos) return true;
+    return false;
+}
+
+static void appendGroup(World& w, const oc::MeshGroup& g, int32_t& vOff, uint32_t& first, uint32_t& count) {
+    vOff = (int32_t)(w.vertices.size() / 3);
+    first = (uint32_t)w.indices.size();
+    count = (uint32_t)g.index.size();
+    for (float f : g.pos) w.vertices.push_back(std::isfinite(f) ? f : 0.0f);
+    w.indices.insert(w.indices.end(), g.index.begin(), g.index.end());
+}
+
+static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
+    std::vector<uint8_t> blob;
+    if (!oc::readZipEntry((dw / "Data2.pak").string(), "data/maps/" + map + "/" + map + ".sobj", blob)) {
+        fprintf(stderr, "map %s not found\n", map.c_str());
+        exit(1);
+    }
+    w.objects = oc::parseSobj(blob);
+    static std::vector<std::unique_ptr<oc::Pack>> packs;
+    std::map<std::string, std::pair<oc::Pack*, const oc::Resource*>> index;
+    for (auto& e : fs::directory_iterator(dw / "Data")) {
+        if (e.path().extension() != ".rpack") continue;
+        try { packs.push_back(std::make_unique<oc::Pack>(e.path().string())); } catch (std::exception&) { continue; }
+        for (auto& r : packs.back()->resources()) if (r.flags == oc::TYPE_MESH) index.emplace(r.name, std::make_pair(packs.back().get(), &r));
+    }
+    w.geom.resize(w.objects.types.size());
+    std::vector<char> used(w.objects.types.size(), 0);
+    for (auto& i : w.objects.instances) used[i.type] = 1;
+    size_t ok = 0;
+    for (size_t t = 0; t < w.objects.types.size(); t++) {
+        if (!used[t] || skipType(w.objects.types[t].mesh)) continue;
+        std::string name = w.objects.types[t].mesh;
+        if (name.size() > 4 && name.substr(name.size() - 4) == ".msh") name.resize(name.size() - 4);
+        auto it = index.find(name);
+        if (it == index.end()) continue;
+        oc::Mesh m;
+        try { if (!oc::loadMesh(*it->second.first, *it->second.second, m)) continue; } catch (std::exception&) { continue; }
+        if (m.groups[0].index.empty()) continue;
+        TypeGeom& g = w.geom[t];
+        g.valid = true;
+        appendGroup(w, m.groups[0], g.vertexOffset[0], g.firstIndex[0], g.indexCount[0]);
+        // far LOD: last group, but only when the groups really are a LOD chain (vertex counts shrink)
+        size_t last = m.groups.size() - 1;
+        bool chain = last > 0;
+        for (size_t i = 1; i <= last && chain; i++) chain = m.groups[i].pos.size() <= m.groups[i - 1].pos.size() && !m.groups[i].index.empty();
+        if (chain) appendGroup(w, m.groups[last], g.vertexOffset[1], g.firstIndex[1], g.indexCount[1]);
+        else { g.vertexOffset[1] = g.vertexOffset[0]; g.firstIndex[1] = g.firstIndex[0]; g.indexCount[1] = g.indexCount[0]; }
+        ok++;
+    }
+    printf("map %s: %zu instances, %zu/%zu types decoded, %zu vertices, %zu indices\n", map.c_str(), w.objects.instances.size(), ok,
+           w.objects.types.size(), w.vertices.size() / 3, w.indices.size());
+}
+
+// ---------------------------------------------------------------- vulkan helpers
+
+struct Gfx {
+    SDL_Window* window = nullptr;
+    VkInstance instance{};
+    VkSurfaceKHR surface{};
+    VkPhysicalDevice phys{};
+    VkDevice dev{};
+    VkQueue queue{};
+    uint32_t family = 0;
+    VkSwapchainKHR swap{};
+    VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkExtent2D extent{};
+    std::vector<VkImage> images;
+    std::vector<VkImageView> views;
+    VkImage depth{};
+    VkDeviceMemory depthMem{};
+    VkImageView depthView{};
+    VkCommandPool pool{};
+    VkPhysicalDeviceMemoryProperties memProps{};
+};
+
+static uint32_t findMem(Gfx& g, uint32_t bits, VkMemoryPropertyFlags want) {
+    for (uint32_t i = 0; i < g.memProps.memoryTypeCount; i++)
+        if ((bits & (1u << i)) && (g.memProps.memoryTypes[i].propertyFlags & want) == want) return i;
+    fprintf(stderr, "no memory type\n");
+    exit(2);
+}
+
+struct Buf { VkBuffer buf{}; VkDeviceMemory mem{}; void* map = nullptr; };
+
+static Buf makeBuffer(Gfx& g, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props, bool mapIt = false) {
+    Buf b;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size; bi.usage = usage; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK(vkCreateBuffer(g.dev, &bi, nullptr, &b.buf));
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g.dev, b.buf, &mr);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size; ai.memoryTypeIndex = findMem(g, mr.memoryTypeBits, props);
+    VK(vkAllocateMemory(g.dev, &ai, nullptr, &b.mem));
+    VK(vkBindBufferMemory(g.dev, b.buf, b.mem, 0));
+    if (mapIt) VK(vkMapMemory(g.dev, b.mem, 0, VK_WHOLE_SIZE, 0, &b.map));
+    return b;
+}
+
+static VkCommandBuffer beginOnce(Gfx& g) {
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = g.pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    VK(vkAllocateCommandBuffers(g.dev, &ai, &cb));
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK(vkBeginCommandBuffer(cb, &bi));
+    return cb;
+}
+
+static void endOnce(Gfx& g, VkCommandBuffer cb) {
+    VK(vkEndCommandBuffer(cb));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    VK(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE));
+    VK(vkQueueWaitIdle(g.queue));
+    vkFreeCommandBuffers(g.dev, g.pool, 1, &cb);
+}
+
+// Uploads `size` bytes to a device-local buffer through a staging buffer (in 256 MB pieces).
+static Buf uploadBuffer(Gfx& g, const void* data, size_t size, VkBufferUsageFlags usage) {
+    if (size == 0) size = 4;
+    Buf dst = makeBuffer(g, size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const size_t piece = 256u << 20;
+    Buf st = makeBuffer(g, std::min(size, piece), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+    for (size_t off = 0; off < size; off += piece) {
+        size_t n = std::min(piece, size - off);
+        if (data) memcpy(st.map, (const uint8_t*)data + off, n);
+        VkCommandBuffer cb = beginOnce(g);
+        VkBufferCopy c{0, off, n};
+        vkCmdCopyBuffer(cb, st.buf, dst.buf, 1, &c);
+        endOnce(g, cb);
+    }
+    vkDestroyBuffer(g.dev, st.buf, nullptr);
+    vkFreeMemory(g.dev, st.mem, nullptr);
+    return dst;
+}
+
+static void destroySwapchain(Gfx& g) {
+    vkDeviceWaitIdle(g.dev);
+    for (auto v : g.views) vkDestroyImageView(g.dev, v, nullptr);
+    g.views.clear();
+    if (g.depthView) { vkDestroyImageView(g.dev, g.depthView, nullptr); vkDestroyImage(g.dev, g.depth, nullptr); vkFreeMemory(g.dev, g.depthMem, nullptr); g.depthView = nullptr; }
+    if (g.swap) { vkDestroySwapchainKHR(g.dev, g.swap, nullptr); g.swap = nullptr; }
+}
+
+static void createSwapchain(Gfx& g) {
+    VkSurfaceCapabilitiesKHR caps;
+    VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps));
+    int w, h;
+    SDL_Vulkan_GetDrawableSize(g.window, &w, &h);
+    g.extent = caps.currentExtent.width != 0xffffffff ? caps.currentExtent
+             : VkExtent2D{std::clamp<uint32_t>(w, caps.minImageExtent.width, caps.maxImageExtent.width),
+                          std::clamp<uint32_t>(h, caps.minImageExtent.height, caps.maxImageExtent.height)};
+    uint32_t n = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(g.phys, g.surface, &n, nullptr);
+    std::vector<VkSurfaceFormatKHR> fm(n);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(g.phys, g.surface, &n, fm.data());
+    VkSurfaceFormatKHR chosen = fm[0];
+    for (auto& f : fm) if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) chosen = f;
+    g.format = chosen.format;
+    VkSwapchainCreateInfoKHR si{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    si.surface = g.surface;
+    si.minImageCount = std::min(caps.minImageCount + 1, caps.maxImageCount ? caps.maxImageCount : 8u);
+    si.imageFormat = chosen.format; si.imageColorSpace = chosen.colorSpace; si.imageExtent = g.extent; si.imageArrayLayers = 1;
+    si.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    si.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE; si.preTransform = caps.currentTransform;
+    si.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; si.presentMode = VK_PRESENT_MODE_FIFO_KHR; si.clipped = VK_TRUE;
+    VK(vkCreateSwapchainKHR(g.dev, &si, nullptr, &g.swap));
+    vkGetSwapchainImagesKHR(g.dev, g.swap, &n, nullptr);
+    g.images.resize(n);
+    vkGetSwapchainImagesKHR(g.dev, g.swap, &n, g.images.data());
+    g.views.resize(n);
+    for (uint32_t i = 0; i < n; i++) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = g.images[i]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = g.format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VK(vkCreateImageView(g.dev, &vi, nullptr, &g.views[i]));
+    }
+    VkImageCreateInfo di{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    di.imageType = VK_IMAGE_TYPE_2D; di.format = VK_FORMAT_D32_SFLOAT; di.extent = {g.extent.width, g.extent.height, 1};
+    di.mipLevels = 1; di.arrayLayers = 1; di.samples = VK_SAMPLE_COUNT_1_BIT; di.tiling = VK_IMAGE_TILING_OPTIMAL;
+    di.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT; di.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK(vkCreateImage(g.dev, &di, nullptr, &g.depth));
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(g.dev, g.depth, &mr);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size; ai.memoryTypeIndex = findMem(g, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK(vkAllocateMemory(g.dev, &ai, nullptr, &g.depthMem));
+    VK(vkBindImageMemory(g.dev, g.depth, g.depthMem, 0));
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = g.depth; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_D32_SFLOAT;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    VK(vkCreateImageView(g.dev, &vi, nullptr, &g.depthView));
+}
+
+static VkShaderModule loadShader(Gfx& g, const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) { fprintf(stderr, "missing shader %s\n", path.c_str()); exit(2); }
+    std::vector<char> code((size_t)f.tellg());
+    f.seekg(0);
+    f.read(code.data(), code.size());
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    ci.codeSize = code.size(); ci.pCode = reinterpret_cast<const uint32_t*>(code.data());
+    VkShaderModule m;
+    VK(vkCreateShaderModule(g.dev, &ci, nullptr, &m));
+    return m;
+}
+
+static void imageBarrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
+                         VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = srcStage; b.srcAccessMask = srcAccess; b.dstStageMask = dstStage; b.dstAccessMask = dstAccess;
+    b.oldLayout = from; b.newLayout = to; b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img; b.subresourceRange = {aspect, 0, 1, 0, 1};
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.imageMemoryBarrierCount = 1; d.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &d);
+}
+
+// ---------------------------------------------------------------- main
+
+struct Draw { uint32_t indexCount, instanceCount, firstIndex; int32_t vertexOffset; uint32_t firstInstance; };
+
+int main(int argc, char** argv) {
+    if (argc < 2) { fprintf(stderr, "usage: oc_viewer <DW dir> [map] [--shot out.ppm] [--cam x y z yaw pitch] [--radius R]\n"); return 1; }
+    fs::path dw = argv[1];
+    std::string map = "old_town", shot;
+    glm::vec3 camPos(300, 70, 100);
+    float yaw = 0.0f, pitch = -0.25f, radius = 450.0f;
+    for (int i = 2; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--shot" && i + 1 < argc) shot = argv[++i];
+        else if (a == "--radius" && i + 1 < argc) radius = (float)atof(argv[++i]);
+        else if (a == "--cam" && i + 5 < argc) { camPos = {(float)atof(argv[i + 1]), (float)atof(argv[i + 2]), (float)atof(argv[i + 3])}; yaw = (float)atof(argv[i + 4]); pitch = (float)atof(argv[i + 5]); i += 5; }
+        else if (a[0] != '-') map = a;
+    }
+
+    World world;
+    loadWorld(dw, map, world);
+
+    SDL_Init(SDL_INIT_VIDEO);
+    Gfx g;
+    g.window = SDL_CreateWindow("openchrome", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    if (!g.window) { fprintf(stderr, "window: %s\n", SDL_GetError()); return 2; }
+
+    uint32_t nExt = 0;
+    SDL_Vulkan_GetInstanceExtensions(g.window, &nExt, nullptr);
+    std::vector<const char*> exts(nExt);
+    SDL_Vulkan_GetInstanceExtensions(g.window, &nExt, exts.data());
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "openchrome"; app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.pApplicationInfo = &app; ici.enabledExtensionCount = nExt; ici.ppEnabledExtensionNames = exts.data();
+    VK(vkCreateInstance(&ici, nullptr, &g.instance));
+    if (!SDL_Vulkan_CreateSurface(g.window, g.instance, &g.surface)) { fprintf(stderr, "surface: %s\n", SDL_GetError()); return 2; }
+
+    uint32_t nd = 0;
+    vkEnumeratePhysicalDevices(g.instance, &nd, nullptr);
+    std::vector<VkPhysicalDevice> devs(nd);
+    vkEnumeratePhysicalDevices(g.instance, &nd, devs.data());
+    int bestScore = -1;
+    for (auto d : devs) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(d, &p);
+        if (p.apiVersion < VK_API_VERSION_1_3) continue;
+        uint32_t nq = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(d, &nq, nullptr);
+        std::vector<VkQueueFamilyProperties> qf(nq);
+        vkGetPhysicalDeviceQueueFamilyProperties(d, &nq, qf.data());
+        for (uint32_t i = 0; i < nq; i++) {
+            VkBool32 pres = VK_FALSE;
+            vkGetPhysicalDeviceSurfaceSupportKHR(d, i, g.surface, &pres);
+            if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && pres) {
+                int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
+                if (score > bestScore) { bestScore = score; g.phys = d; g.family = i; }
+                break;
+            }
+        }
+    }
+    if (!g.phys) { fprintf(stderr, "no Vulkan 1.3 device\n"); return 2; }
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    printf("GPU: %s\n", props.deviceName);
+    vkGetPhysicalDeviceMemoryProperties(g.phys, &g.memProps);
+
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    qi.queueFamilyIndex = g.family; qi.queueCount = 1; qi.pQueuePriorities = &prio;
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    f13.dynamicRendering = VK_TRUE; f13.synchronization2 = VK_TRUE;
+    const char* devExt[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.pNext = &f13; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qi; dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = devExt;
+    VK(vkCreateDevice(g.phys, &dci, nullptr, &g.dev));
+    vkGetDeviceQueue(g.dev, g.family, 0, &g.queue);
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pci.queueFamilyIndex = g.family;
+    VK(vkCreateCommandPool(g.dev, &pci, nullptr, &g.pool));
+    createSwapchain(g);
+
+    // geometry
+    Buf vbuf = uploadBuffer(g, world.vertices.data(), world.vertices.size() * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    Buf ibuf = uploadBuffer(g, world.indices.data(), world.indices.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    const size_t maxInst = world.objects.instances.size();
+    constexpr int FRAMES = 2;
+    Buf inst[FRAMES];
+    for (auto& b : inst)
+        b = makeBuffer(g, std::max<size_t>(maxInst, 1) * sizeof(GpuInstance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+
+    // pipeline
+    std::string exeDir = SDL_GetBasePath();
+    VkShaderModule vs = loadShader(g, exeDir + "mesh.vert.spv"), fsm = loadShader(g, exeDir + "mesh.frag.spv");
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(glm::mat4) + sizeof(glm::vec4)};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    VkPipelineLayout layout;
+    VK(vkCreatePipelineLayout(g.dev, &plci, nullptr, &layout));
+    VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fsm; stages[1].pName = "main";
+    VkVertexInputBindingDescription binds[2] = {{0, 12, VK_VERTEX_INPUT_RATE_VERTEX}, {1, sizeof(GpuInstance), VK_VERTEX_INPUT_RATE_INSTANCE}};
+    VkVertexInputAttributeDescription attrs[4] = {
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 1, VK_FORMAT_R32G32B32_SFLOAT, 0},
+        {2, 1, VK_FORMAT_R32G32B32_SFLOAT, 16}, {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32}};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = binds; vi.vertexAttributeDescriptionCount = 4; vi.pVertexAttributeDescriptions = attrs;
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1; vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dsi.dynamicStateCount = 2; dsi.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo rci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rci.colorAttachmentCount = 1; rci.pColorAttachmentFormats = &g.format; rci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+    VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpi.pNext = &rci; gpi.stageCount = 2; gpi.pStages = stages; gpi.pVertexInputState = &vi; gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vp; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms; gpi.pDepthStencilState = &ds;
+    gpi.pColorBlendState = &cb; gpi.pDynamicState = &dsi; gpi.layout = layout;
+    VkPipeline pipeline;
+    VK(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipeline));
+
+    // frame resources
+    VkCommandBuffer cmds[FRAMES];
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = g.pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = FRAMES;
+    VK(vkAllocateCommandBuffers(g.dev, &cai, cmds));
+    VkSemaphore imageAvail[FRAMES];
+    VkFence fences[FRAMES];
+    std::vector<VkSemaphore> renderDone;
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    for (int i = 0; i < FRAMES; i++) { VK(vkCreateSemaphore(g.dev, &sci, nullptr, &imageAvail[i])); VK(vkCreateFence(g.dev, &fci, nullptr, &fences[i])); }
+    auto makeRenderDone = [&]() {
+        for (auto s : renderDone) vkDestroySemaphore(g.dev, s, nullptr);
+        renderDone.resize(g.images.size());
+        for (auto& s : renderDone) VK(vkCreateSemaphore(g.dev, &sci, nullptr, &s));
+    };
+    makeRenderDone();
+    Buf shotBuf;
+    if (!shot.empty()) shotBuf = makeBuffer(g, 1u << 26, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+
+    // per-frame culling scratch
+    const size_t nb = world.geom.size() * 2;
+    std::vector<uint32_t> counts(nb), starts(nb), fill(nb), vis, visBucket;
+    std::vector<Draw> draws;
+    SDL_SetRelativeMouseMode(shot.empty() ? SDL_TRUE : SDL_FALSE);
+    float speed = 40.0f;
+    uint64_t last = SDL_GetPerformanceCounter();
+    int frame = 0;
+    bool running = true, resized = false;
+    double acc = 0; int accN = 0;
+
+    while (running) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) running = false;
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
+            else if (e.type == SDL_MOUSEMOTION && SDL_GetRelativeMouseMode()) { yaw += e.motion.xrel * 0.0025f; pitch = std::clamp(pitch - e.motion.yrel * 0.0025f, -1.55f, 1.55f); }
+            else if (e.type == SDL_MOUSEWHEEL) speed = std::clamp(speed * (e.wheel.y > 0 ? 1.25f : 0.8f), 2.0f, 2000.0f);
+            else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) resized = true;
+        }
+        uint64_t now = SDL_GetPerformanceCounter();
+        float dt = (float)((double)(now - last) / (double)SDL_GetPerformanceFrequency());
+        last = now;
+        glm::vec3 fwd(std::cos(pitch) * std::cos(yaw), std::sin(pitch), std::cos(pitch) * std::sin(yaw));
+        glm::vec3 right = glm::normalize(glm::cross(fwd, glm::vec3(0, 1, 0)));
+        const Uint8* k = SDL_GetKeyboardState(nullptr);
+        float sp = speed * (k[SDL_SCANCODE_LSHIFT] ? 5.0f : 1.0f) * (k[SDL_SCANCODE_LCTRL] ? 0.2f : 1.0f);
+        if (k[SDL_SCANCODE_W]) camPos += fwd * sp * dt;
+        if (k[SDL_SCANCODE_S]) camPos -= fwd * sp * dt;
+        if (k[SDL_SCANCODE_D]) camPos += right * sp * dt;
+        if (k[SDL_SCANCODE_A]) camPos -= right * sp * dt;
+        if (k[SDL_SCANCODE_E]) camPos.y += sp * dt;
+        if (k[SDL_SCANCODE_Q]) camPos.y -= sp * dt;
+
+        int fi = frame % FRAMES;
+        VK(vkWaitForFences(g.dev, 1, &fences[fi], VK_TRUE, UINT64_MAX));
+        uint32_t imgIdx;
+        VkResult ar = vkAcquireNextImageKHR(g.dev, g.swap, UINT64_MAX, imageAvail[fi], VK_NULL_HANDLE, &imgIdx);
+        if (ar == VK_ERROR_OUT_OF_DATE_KHR || resized) {
+            resized = false;
+            destroySwapchain(g); createSwapchain(g); makeRenderDone();
+            continue;
+        }
+        VK(vkResetFences(g.dev, 1, &fences[fi]));
+
+        // cull + bucket instances by (type, lod)
+        std::fill(counts.begin(), counts.end(), 0u);
+        vis.clear(); visBucket.clear();
+        const float r2 = radius * radius, lodDist2 = 90.0f * 90.0f;
+        for (size_t i = 0; i < maxInst; i++) {
+            const oc::Instance& in = world.objects.instances[i];
+            const TypeGeom& tg = world.geom[in.type];
+            if (!tg.valid) continue;
+            glm::vec3 d(in.pos[0] - camPos.x, in.pos[1] - camPos.y, in.pos[2] - camPos.z);
+            float d2 = glm::dot(d, d);
+            if (d2 > r2 || glm::dot(d, fwd) < -40.0f) continue;
+            uint32_t b = in.type * 2 + (d2 > lodDist2 ? 1 : 0);
+            vis.push_back((uint32_t)i); visBucket.push_back(b); counts[b]++;
+        }
+        uint32_t run = 0;
+        for (size_t b = 0; b < nb; b++) { starts[b] = run; fill[b] = 0; run += counts[b]; }
+        GpuInstance* dst = (GpuInstance*)inst[fi].map;
+        for (size_t v = 0; v < vis.size(); v++) {
+            const oc::Instance& in = world.objects.instances[vis[v]];
+            GpuInstance& o = dst[starts[visBucket[v]] + fill[visBucket[v]]++];
+            memcpy(o.pos, in.pos, 12); memcpy(o.scale, in.scale, 12);
+            for (int c = 0; c < 4; c++) o.quat[c] = in.quat[c] / 32767.0f;
+        }
+        draws.clear();
+        for (size_t b = 0; b < nb; b++) {
+            if (!counts[b]) continue;
+            const TypeGeom& tg = world.geom[b / 2];
+            int lod = (int)(b & 1);
+            draws.push_back({tg.indexCount[lod], counts[b], tg.firstIndex[lod], tg.vertexOffset[lod], starts[b]});
+        }
+
+        VkCommandBuffer cmd = cmds[fi];
+        VK(vkResetCommandBuffer(cmd, 0));
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VK(vkBeginCommandBuffer(cmd, &bi));
+        imageBarrier(cmd, g.images[imgIdx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        imageBarrier(cmd, g.depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+        VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        ca.imageView = g.views[imgIdx]; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE; ca.clearValue.color = {{0.72f, 0.80f, 0.88f, 1.0f}};
+        da.imageView = g.depthView; da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; da.clearValue.depthStencil = {1.0f, 0};
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea = {{0, 0}, g.extent}; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca; ri.pDepthAttachment = &da;
+        vkCmdBeginRendering(cmd, &ri);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        VkViewport viewport{0, 0, (float)g.extent.width, (float)g.extent.height, 0, 1};
+        VkRect2D sc{{0, 0}, g.extent};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        struct { glm::mat4 vp; glm::vec4 cam; } pc;
+        glm::mat4 proj = glm::perspective(glm::radians(65.0f), (float)g.extent.width / (float)g.extent.height, 0.3f, radius * 2.0f);
+        proj[1][1] *= -1.0f;
+        pc.vp = proj * glm::lookAt(camPos, camPos + fwd, glm::vec3(0, 1, 0));
+        pc.cam = glm::vec4(camPos, 2.5f / radius);
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+        VkBuffer vbs[2] = {vbuf.buf, inst[fi].buf};
+        VkDeviceSize offs[2] = {0, 0};
+        vkCmdBindVertexBuffers(cmd, 0, 2, vbs, offs);
+        vkCmdBindIndexBuffer(cmd, ibuf.buf, 0, VK_INDEX_TYPE_UINT32);
+        for (const Draw& d : draws) vkCmdDrawIndexed(cmd, d.indexCount, d.instanceCount, d.firstIndex, d.vertexOffset, d.firstInstance);
+        vkCmdEndRendering(cmd);
+        bool takeShot = !shot.empty() && frame == 8;
+        if (takeShot) {
+            imageBarrier(cmd, g.images[imgIdx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            VkBufferImageCopy bc{};
+            bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bc.imageExtent = {g.extent.width, g.extent.height, 1};
+            vkCmdCopyImageToBuffer(cmd, g.images[imgIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shotBuf.buf, 1, &bc);
+            imageBarrier(cmd, g.images[imgIdx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
+        } else {
+            imageBarrier(cmd, g.images[imgIdx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
+        }
+        VK(vkEndCommandBuffer(cmd));
+        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.waitSemaphoreCount = 1; si.pWaitSemaphores = &imageAvail[fi]; si.pWaitDstStageMask = &waitStage;
+        si.commandBufferCount = 1; si.pCommandBuffers = &cmd; si.signalSemaphoreCount = 1; si.pSignalSemaphores = &renderDone[imgIdx];
+        VK(vkQueueSubmit(g.queue, 1, &si, fences[fi]));
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &renderDone[imgIdx]; pi.swapchainCount = 1; pi.pSwapchains = &g.swap; pi.pImageIndices = &imgIdx;
+        VkResult pr = vkQueuePresentKHR(g.queue, &pi);
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) resized = true;
+        if (takeShot) {
+            vkQueueWaitIdle(g.queue);
+            std::ofstream f(shot, std::ios::binary);
+            f << "P6\n" << g.extent.width << " " << g.extent.height << "\n255\n";
+            const uint8_t* px = (const uint8_t*)shotBuf.map;
+            bool bgr = g.format == VK_FORMAT_B8G8R8A8_UNORM || g.format == VK_FORMAT_B8G8R8A8_SRGB;
+            std::vector<char> row(g.extent.width * 3);
+            for (uint32_t y = 0; y < g.extent.height; y++) {
+                for (uint32_t x = 0; x < g.extent.width; x++) {
+                    const uint8_t* p = px + ((size_t)y * g.extent.width + x) * 4;
+                    row[3 * x] = (char)(bgr ? p[2] : p[0]); row[3 * x + 1] = (char)p[1]; row[3 * x + 2] = (char)(bgr ? p[0] : p[2]);
+                }
+                f.write(row.data(), row.size());
+            }
+            printf("screenshot %s: %zu instances, %zu draws\n", shot.c_str(), vis.size(), draws.size());
+            running = false;
+        }
+        acc += dt; accN++;
+        if (accN == 120 && shot.empty()) {
+            char title[160];
+            snprintf(title, sizeof title, "openchrome  %.1f fps  %zu instances  %zu draws", accN / acc, vis.size(), draws.size());
+            SDL_SetWindowTitle(g.window, title);
+            acc = 0; accN = 0;
+        }
+        frame++;
+    }
+    vkDeviceWaitIdle(g.dev);
+    SDL_Quit();
+    return 0;
+}

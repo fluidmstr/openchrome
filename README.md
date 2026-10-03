@@ -17,3 +17,12 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6).
 - [ ] gameplay
 
 Unofficial fan project, not affiliated with Techland. Dying Light is a trademark of its owners.
+
+## Build and run (Windows, MSVC + Vulkan SDK)
+
+```
+build.bat                     # CMake + NMake, output in buildbuild\oc_viewer.exe "F:\SteamLibrary\steamapps\common\Dying Light\DW" old_town
+```
+
+WASD fly, mouse look, Q/E down/up, Shift/Ctrl speed, wheel changes speed, Esc quits. `--shot out.ppm --cam x y z yaw pitch` writes a screenshot. `oc_probe` decodes all meshes of a map as a smoke test.
+
