@@ -31,3 +31,7 @@ Index blocks: each group's u16 triangle list starts at a 4-byte aligned position
 Fast path for kits: when every group has the same stride and the padded sizes fill the buffer, that stride is used without the search. Not yet decoded: tangent semantics, skinned layouts of other strides.
 
 `tools/mesh.py <pack> <outdir> [filter]` writes OBJ (positions, uv, one `g` per submesh, `usemtl` from the .mat names).
+
+## Terrain tiles (`*_buildterrain_N`, stride 20)
+
+Verified by rendering: stride-20 groups whose materials are `*_t2_*` carry no uv and no normal. Bytes 8 and 10 of each vertex are unorm8 blend weights of layers 1 and 2 (byte 9 and 11 are other data, 11 is always 127); layer 0 gets the remainder. Layer textures are the material's `s_dif_0..2` (letters in the material name, e.g. `0202abc`, select them; the digits are unknown). Texture coordinates are not stored: the viewer tiles the layers planar in world space (`xz * 0.25`, scale guessed). Normals are not stored either (flat shading from derivatives for now).

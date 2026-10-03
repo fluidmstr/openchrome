@@ -27,7 +27,8 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6), wri
 | Skeletons, skin weights, static poses, CPU skinning | working, [spec](docs/formats/anim.md) |
 | Animation tracks (bit-packed ANM2 streams) | in progress |
 | Procedural sky (gradient, sun, night stars) | done (not the game's own sky) |
-| Terrain layer blending, vegetation, navmesh, gameplay | open |
+| Terrain layer blending (vertex weights, world-space tiling), alpha-tested foliage | working |
+| Vegetation `.to`, navmesh, gameplay | open |
 
 <img src="docs/img/characters.jpg" align="right" width="42%" alt="Textured character in bind pose and in a clip pose">
 

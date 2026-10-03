@@ -47,7 +47,8 @@ struct TypeGeom {
 
 struct GpuInstance { float pos[3], p0, scale[3], p1, quat[4]; };  // 48 bytes
 
-struct MatInfo { std::string name, tex, dyeMask, dyePal, nrm, spc; int slot = 0; int state = 0; int nrmSlot = 0, spcSlot = 0; };  // state: 0 pending, 1 resolved
+struct MatInfo { std::string name, tex, dyeMask, dyePal, nrm, spc; int slot = 0; int state = 0; int nrmSlot = 0, spcSlot = 0;
+                 bool terrain = false; std::string lay[2]; int laySlot[2] = {0, 0}; };  // terrain: `*_t2_*` blend materials, extra layers s_dif_1/2  // state: 0 pending, 1 resolved
 
 struct ItemSpawn { std::string id; float pos[3]; float yaw; };  // --item: inventory item mesh by id
 
@@ -91,6 +92,13 @@ static uint32_t matId(World& w, const std::string& name) {
         if (!w.textures.count(mi.nrm)) mi.nrm.clear();
         if (!w.textures.count(mi.spc)) mi.spc.clear();
     }
+    if (w.db && name.find("_t2_") != std::string::npos) {
+        mi.terrain = true;
+        for (int k = 0; k < 2; k++) {
+            mi.lay[k] = w.db->sampler(name, k ? "s_dif_2" : "s_dif_1");
+            if (!w.textures.count(mi.lay[k])) mi.lay[k].clear();
+        }
+    }
     w.mats.push_back(mi);
     w.matIndex[name] = id;
     return id;
@@ -101,11 +109,23 @@ static void appendGroup(World& w, const oc::MeshGroup& g, const std::vector<std:
     uint32_t base = (uint32_t)w.indices.size();
     size_t nv = g.pos.size() / 3;
     auto clean = [](float f) { return std::isfinite(f) && std::fabs(f) < 1e6f ? f : 0.0f; };
+    // stride-20 terrain tiles carry no uv and no normal: bytes 8 and 10 are the layer blend weights (stored in uv)
+    bool terrain = g.stride == 20 && !g.normal.empty();
+    {
+        bool any = false;
+        for (uint16_t k : g.material) any |= k < mats.size() && mats[k].find("_t2_") != std::string::npos;
+        terrain = terrain && any;
+    }
     for (size_t v = 0; v < nv; v++) {
         for (int k = 0; k < 3; k++) w.vertices.push_back(clean(g.pos[3 * v + k]));
-        w.vertices.push_back(g.uv.empty() ? 0.0f : clean(g.uv[2 * v]));
-        w.vertices.push_back(g.uv.empty() ? 0.0f : clean(g.uv[2 * v + 1]));
-        uint32_t nb = g.normal.empty() ? 0u : g.normal[v];
+        if (terrain) {
+            w.vertices.push_back((g.normal[v] & 0xffu) / 255.0f);
+            w.vertices.push_back(((g.normal[v] >> 16) & 0xffu) / 255.0f);
+        } else {
+            w.vertices.push_back(g.uv.empty() ? 0.0f : clean(g.uv[2 * v]));
+            w.vertices.push_back(g.uv.empty() ? 0.0f : clean(g.uv[2 * v + 1]));
+        }
+        uint32_t nb = g.normal.empty() || terrain ? 0u : g.normal[v];
         float nf;
         memcpy(&nf, &nb, 4);
         w.vertices.push_back(nf);
@@ -1135,6 +1155,8 @@ int main(int argc, char** argv) {
             };
             extra(m.nrm, m.nrmSlot);
             extra(m.spc, m.spcSlot);
+            extra(m.lay[0], m.laySlot[0]);
+            extra(m.lay[1], m.laySlot[1]);
         }
 
         VkCommandBuffer cmd = cmds[fi];
@@ -1187,7 +1209,7 @@ int main(int argc, char** argv) {
         VkRect2D sc{{0, 0}, g.extent};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &sc);
-        struct { glm::mat4 vp; glm::vec4 cam; uint32_t tex; uint32_t nrmSpc; uint32_t pad[2]; } pc{};
+        struct { glm::mat4 vp; glm::vec4 cam; uint32_t tex; uint32_t nrmSpc; uint32_t layers[2]; } pc{};
         glm::mat4 proj = glm::perspective(glm::radians(65.0f), (float)g.extent.width / (float)g.extent.height, 0.3f, std::max(radius * 2.0f, 20000.0f));
         proj[1][1] *= -1.0f;
         pc.vp = proj * glm::lookAt(camPos, camPos + fwd, glm::vec3(0, 1, 0));
@@ -1206,6 +1228,8 @@ int main(int argc, char** argv) {
         for (const Draw& d : draws) {
             pc.tex = (uint32_t)world.mats[d.mat].slot;
             pc.nrmSpc = (uint32_t)world.mats[d.mat].nrmSlot | (uint32_t)world.mats[d.mat].spcSlot << 16;
+            pc.layers[0] = world.mats[d.mat].terrain ? 0x80000000u | (uint32_t)world.mats[d.mat].laySlot[0] : 0u;
+            pc.layers[1] = (uint32_t)world.mats[d.mat].laySlot[1];
             vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
             vkCmdDrawIndexed(cmd, d.indexCount, d.instanceCount, d.firstIndex, d.vertexOffset, d.firstInstance);
         }

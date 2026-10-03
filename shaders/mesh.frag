@@ -24,6 +24,8 @@ layout(push_constant) uniform PC {
     vec4 cam;
     uint tex;
     uint nrmSpc;  // low 16 bits normal map slot, high 16 specular map slot (0 = none)
+    uint layer1;  // terrain blend material: bit 31 set, low bits = slot of layer 1 (0 = missing)
+    uint layer2;
 } pc;
 
 vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
@@ -83,7 +85,22 @@ void main() {
     if (nslot != 0u) N = mapNormal(N, nslot);
     float ndl = max(dot(N, frame.sunDir.xyz), 0.0) * shadow;
     vec3 hemi = mix(frame.groundColor.rgb, frame.skyColor.rgb, N.y * 0.5 + 0.5);
-    vec3 albedo = pow(texture(textures[pc.tex], uv).rgb, vec3(2.2));
+    vec3 albedo;
+    if ((pc.layer1 & 0x80000000u) != 0u) {
+        // uv carries the blend weights of layers 1 and 2; layers are tiled in world space
+        vec2 tuv = wpos.xz * 0.25;
+        uint s1 = pc.layer1 & 0xffffu, s2 = pc.layer2;
+        float w1 = s1 != 0u ? uv.x : 0.0, w2 = s2 != 0u ? uv.y : 0.0;
+        float w0 = max(1.0 - w1 - w2, 0.0), sum = w0 + w1 + w2;
+        vec3 c = texture(textures[pc.tex], tuv).rgb * w0;
+        if (s1 != 0u) c += texture(textures[s1], tuv).rgb * w1;
+        if (s2 != 0u) c += texture(textures[s2], tuv).rgb * w2;
+        albedo = pow(c / sum, vec3(2.2));
+    } else {
+        vec4 s = texture(textures[pc.tex], uv);
+        if (s.a < 0.4) discard;  // cut-out foliage and fences
+        albedo = pow(s.rgb, vec3(2.2));
+    }
     vec3 col = albedo * (hemi * 0.7 + frame.sunColor.rgb * ndl);
     if (sslot != 0u) {
         vec4 sp = texture(textures[sslot], uv);

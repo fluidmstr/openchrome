@@ -50,7 +50,7 @@ Open: the real blend of the tiling layers and the `dye` tint, car paint (green f
 `words[2]` of a material is a key in the `templates_*` sections (the same key may appear in several: pass variants; the first one found is used). A template is a list of descriptor keys (`pass_states`, `blend_states`, `hl_shaders`, `expressions`). `hl_shaders` blobs of pixel shaders contain `[sampler name key][flags]` pairs (names are `s_dif_0`, `s_nrm_0`, `s_spc_0`, `s_dye`, `s_clr`, ... in `strings`; bytecode itself is DXBC in `shaders_t`).
 
 Binding: the material's slot records are in ascending order of `flags & 0xfff` of the template's samplers (flags with bits 0xf000 set are global samplers, skipped). Record *i* is the texture of sampler *i*. In 90% of materials the counts match; the rest (extra global samplers) fall back to the name heuristic.
-Albedo = texture bound to `s_dif_0`, else `s_clr`, `s_dif`, `s_det_clr_0` (`MaterialDb::bound`). Terrain blends use `s_dif_0..2` (layers) + `s_nrm_*`/`s_spc_*`; blend weights come from elsewhere (vertex colour / `_t2mat.scr`), not decoded.
+Albedo = texture bound to `s_dif_0`, else `s_clr`, `s_dif`, `s_det_clr_0` (`MaterialDb::bound`). Terrain blends use `s_dif_0..2` (layers) + `s_nrm_*`/`s_spc_*`; blend weights are vertex bytes of the terrain tiles (see mesh.md, terrain tiles). Cut-out materials (foliage, fences) are drawn with an alpha test at 0.4 on the albedo alpha; which materials really are cut-out is not decoded.
 
 ## Character dye (guessed, looks right)
 
