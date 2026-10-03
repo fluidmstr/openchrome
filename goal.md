@@ -12,13 +12,13 @@ A playable Dying Light 1, started like the stock executable: point `openchrome` 
 
 ## Milestones
 
-1. **Data layer** (mostly done): `.rpack`, `.pak`, textures, meshes, materials, map placement, lights, skeletons, static poses. Open: memory-mapped streaming (done for `.rpack`), `.to` vegetation, terrain layer blending, remaining `.exp` classes.
+1. **Data layer** (mostly done): `.rpack`, `.pak`, textures, meshes, materials, map placement, lights, skeletons, static poses. Terrain layer blending is done (vertex weights). Open: `.to` foliage masks (see foliage.md), remaining `.exp` classes.
 2. **World view**: sky, clouds, weather, vegetation, terrain, water, decals, streaming of neighbouring map regions, LOD.
 3. **Animation**: ANM2 animated tracks, blending, IK, ragdoll, facial animation.
 4. **Scripts and logic**: the `.scr` script format, game objects and their classes, triggers, spawn points, encounters, quest state machine, save games. This is the largest unknown and decides everything after it.
-5. **Physics**: PhysX-cooked collision (`dkcP` blobs) with an open physics engine, character controller, climbing, vehicles.
+5. **Physics**: a stand-in walk mode (gravity, jump, collision against the render meshes) exists in the viewer; real PhysX-cooked collision (`dkcP` blobs) with an open physics engine, character controller, climbing, vehicles.
 6. **Gameplay**: player movement and parkour, weapons, crafting, infected and human AI, navigation mesh, night hunters.
-7. **Audio**: reverse the sound banks and music format, 3D mixing, dialogue.
+7. **Audio**: banks are FMOD FSB5 (`audio.md`); music (IMA ADPCM) decodes and plays, effects are FMOD Vorbis whose setup headers are not in the files (open). 3D mixing, dialogue.
 8. **Cutscenes and story**: camera tracks, character timelines, subtitles, localisation tables, mission flow of the campaign.
 9. **UI**: Scaleform/GFx or the engine's own format for menus and HUD, input remapping, settings.
 10. **Polish**: performance, shipping a `--game-dir` launcher, compatibility with game versions and mods.
