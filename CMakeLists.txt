@@ -1,0 +1,41 @@
+cmake_minimum_required(VERSION 3.20)
+project(openchrome CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+include(FetchContent)
+FetchContent_Declare(zlib URL https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz)
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(zlib)
+
+add_library(oc_core src/core/rpack.cpp src/core/mesh.cpp src/core/sobj.cpp src/core/zip.cpp)
+target_include_directories(oc_core PUBLIC src ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
+target_link_libraries(oc_core PUBLIC zlibstatic)
+if(MSVC)
+  target_compile_options(oc_core PRIVATE /W3 /utf-8)
+endif()
+
+add_executable(oc_probe src/tools/probe.cpp)
+target_link_libraries(oc_probe oc_core)
+
+# Viewer needs the Vulkan SDK (VULKAN_SDK env) which also ships SDL2 and glslc.
+if((DEFINED ENV{VULKAN_SDK} OR EXISTS "C:/VulkanSDK") AND EXISTS "${CMAKE_SOURCE_DIR}/src/viewer/main.cpp")
+  set(VK_SDK "$ENV{VULKAN_SDK}")
+  if(NOT VK_SDK)
+    file(GLOB _sdk "C:/VulkanSDK/*")
+    list(GET _sdk -1 VK_SDK)
+  endif()
+  add_executable(oc_viewer src/viewer/main.cpp)
+  target_include_directories(oc_viewer PRIVATE "${VK_SDK}/Include" "${VK_SDK}/Include/SDL2" "${VK_SDK}/Include/glm")
+  target_link_directories(oc_viewer PRIVATE "${VK_SDK}/Lib")
+  target_link_libraries(oc_viewer oc_core vulkan-1 SDL2 SDL2main)
+  find_program(GLSLC glslc HINTS "${VK_SDK}/Bin")
+  foreach(s mesh.vert mesh.frag)
+    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/${s}.spv
+      COMMAND ${GLSLC} ${CMAKE_SOURCE_DIR}/shaders/${s} -o ${CMAKE_BINARY_DIR}/${s}.spv
+      DEPENDS ${CMAKE_SOURCE_DIR}/shaders/${s})
+    target_sources(oc_viewer PRIVATE ${CMAKE_BINARY_DIR}/${s}.spv)
+  endforeach()
+  add_custom_command(TARGET oc_viewer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VK_SDK}/Bin/SDL2.dll" $<TARGET_FILE_DIR:oc_viewer>)
+endif()

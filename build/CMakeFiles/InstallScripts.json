@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"F:/projects/openchrome-6/build/cmake_install.cmake",
+		"F:/projects/openchrome-6/build/_deps/zlib-build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
