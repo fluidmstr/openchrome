@@ -45,3 +45,12 @@ Rejected: bit-plane decoding of the rows (rows as bit planes of 16 frames) gives
 ### Second probe: `lp_air_fatin_forced_14` (97 frames, 118 bones, 2 animated channels)
 
 Same layout; block offsets 280, 284, 287, 292, 296, 301, 306, 309 (16-byte units, 8 blocks of about 12 frames), block sizes 4, 3, 5, 4, 5, 5, 3 rows. Observations that hold for both probes: the first 16 bytes of a block are 8 u16 lanes where lanes `0..animated-1` carry one value per animated channel (e.g. `f400 4400`) and the unused lanes hold `0x80xx` words; the rows after the header use only the first `animated` lanes and the other lanes are zero. Not working: raw u16 samples, bit planes of a row, 2..12 bit packing of the used bytes (smoothness test on `m_fpp_lowstamina` block 0). The per-channel header values and the `0x80xx` words are probably a per-block range or bit-width table; decoding needs a clip with a known motion (a looping idle where the same value must return at the loop point).
+
+### Third probe: block structure (new, partly verified)
+
+Both probes fit one grid model (verified on `m_fpp_lowstamina` and `lp_air_fatin_forced_14`):
+- The stream is a grid of 8 u16 cells per 16-byte row; an animated channel sits in the lane `channel index mod 8` (`lowstamina`: lanes 0-2, `lp_air`: lanes 4-5; lane = position of the zero bit in the 0xff mask before the stream).
+- A block starts with a header row: the animated channels' header cells (bytes `d, v`: `d` a small signed byte, `v` a byte; meaning unknown) and in the remaining lanes `8 - A` width cells `[0x80][hi:lo nibbles]`, i.e. `2*(8-A)` widths = frames per block (10 for A=3, 12 for A=2, 14 for A=1). When the channel lanes are not at the start of the row (`lp_air`) the width cells continue in lanes 0.. of the next 16-byte unit (the header row is the 8 consecutive cells from the first channel lane).
+- Data rows follow, one per 16 bits per channel: each channel's data is the column of its lane, read as a bit stream, **MSB first** within each u16. Row count per block fits `ceil(bits / 16)`.
+- Bits per frame: width `w` > 0 costs about `w + 3` bits (zero width costs 0 or ~1); this reproduces the bit counts of 4 of 4 blocks of `lowstamina` to within the final padding (block tails are zero padded). The exact cost for `w >= 5` and for `w = 0` is not settled.
+- Not found: how a `(w+3)`-bit chunk becomes a value (two's complement, sign-magnitude and 3+w splits do not give smooth quaternion tracks), the meaning of the header cells, and the base/scale of the dequantisation.
