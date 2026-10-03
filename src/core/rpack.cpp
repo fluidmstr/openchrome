@@ -3,6 +3,8 @@
 #include <zlib.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <stdexcept>
 
@@ -44,9 +46,27 @@ Pack::Pack(const std::string& path) : path_(path) {
     }
 }
 
+// Inflated streams are cached on disk (shared with tools/rpack.py): $RPACK_CACHE or ./out/cache,
+// file name <pack file>.<pack size>.<stream index>.
+static std::string cachePath(const std::string& pack, size_t i) {
+    namespace fs = std::filesystem;
+    const char* env = getenv("RPACK_CACHE");
+    fs::path dir = env ? fs::path(env) : fs::path("out") / "cache";
+    std::error_code ec;
+    uintmax_t size = fs::file_size(pack, ec);
+    return (dir / (fs::path(pack).filename().string() + "." + std::to_string(size) + "." + std::to_string(i))).string();
+}
+
 const std::vector<uint8_t>& Pack::stream(size_t i) {
     Stream& s = streams_.at(i);
     if (s.loaded) return s.data;
+    std::string cache = cachePath(path_, i);
+    if (FILE* cf = fopen(cache.c_str(), "rb")) {
+        s.data.resize(s.usize);
+        size_t n = s.usize ? fread(s.data.data(), 1, s.usize, cf) : 0;
+        fclose(cf);
+        if (n == s.usize) { s.loaded = true; return s.data; }
+    }
     FILE* f = fopen(path_.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open " + path_);
     _fseeki64(f, s.offset, SEEK_SET);
@@ -69,6 +89,16 @@ const std::vector<uint8_t>& Pack::stream(size_t i) {
     }
     fclose(f);
     s.loaded = true;
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(cache).parent_path(), ec);
+        std::string tmp = cache + ".tmp";
+        if (FILE* cf = fopen(tmp.c_str(), "wb")) {
+            bool ok = fwrite(s.data.data(), 1, s.data.size(), cf) == s.data.size();
+            fclose(cf);
+            if (ok) std::filesystem::rename(tmp, cache, ec); else std::filesystem::remove(tmp, ec);
+        }
+    }
     return s.data;
 }
 

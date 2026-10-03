@@ -48,7 +48,11 @@ struct GpuInstance { float pos[3], p0, scale[3], p1, quat[4]; };  // 48 bytes
 
 struct MatInfo { std::string name, tex; int slot = 0; int state = 0; };  // state: 0 pending, 1 resolved
 
+struct Spawn { std::string mesh, clip; float pos[3]; float yaw; std::vector<int> parts; std::map<int, std::string> partMat; };  // --spawn: skinned character in a static pose
+
 struct World {
+    bool nomap = false;  // --nomap: only --spawn characters (fast test scene)
+    std::vector<Spawn> spawns;
     std::vector<float> vertices;     // x y z u v + packed snorm8 normal (uint32 bits), 6 floats per vertex
     std::vector<uint32_t> indices;
     std::vector<TypeGeom> geom;      // per object type
@@ -94,10 +98,67 @@ static void appendGroup(World& w, const oc::MeshGroup& g, const std::vector<std:
     w.indices.insert(w.indices.end(), g.index.begin(), g.index.end());
     uint32_t acc = 0;
     for (size_t k = 0; k < g.counts.size(); k++) {
-        uint32_t m = mats.empty() ? 0 : matId(w, mats[std::min(k, mats.size() - 1)]);
+        size_t mi = k < g.material.size() && g.material[k] < mats.size() ? g.material[k] : std::min(k, mats.size() - 1);
+        uint32_t m = mats.empty() ? 0 : matId(w, mats[mi]);
         subs.push_back({base + acc, g.counts[k], m});
         acc += g.counts[k];
     }
+}
+
+// CPU-skins group 0 of a skinned mesh into `pose` (bind pose when null) and returns it as a plain static group.
+static oc::MeshGroup skinGroup(const oc::Mesh& m, const oc::Pose* pose, size_t gi = 0) {
+    oc::MeshGroup g = m.groups[gi];
+    if (g.boneIdx.empty()) return g;
+    auto sk = oc::skinMatrices(m.skeleton, pose);
+    auto unpack = [](uint32_t p, int c) { int8_t b = (int8_t)((p >> (8 * c)) & 255); return std::max(-1.0f, b / 127.0f); };
+    for (size_t v = 0; v < g.pos.size() / 3; v++) {
+        float p[3] = {g.pos[3 * v], g.pos[3 * v + 1], g.pos[3 * v + 2]}, np[3] = {0, 0, 0}, nn[3] = {0, 0, 0};
+        float n[3] = {unpack(g.normal[v], 0), unpack(g.normal[v], 1), unpack(g.normal[v], 2)};
+        float wsum = 0;
+        for (int c = 0; c < 4; c++) {
+            float w = g.boneW[4 * v + c] / 255.0f;
+            if (w <= 0) continue;
+            const oc::Mat34& M = sk[g.boneIdx[4 * v + c]];
+            wsum += w;
+            for (int r = 0; r < 3; r++) {
+                np[r] += w * (M[4 * r] * p[0] + M[4 * r + 1] * p[1] + M[4 * r + 2] * p[2] + M[4 * r + 3]);
+                nn[r] += w * (M[4 * r] * n[0] + M[4 * r + 1] * n[1] + M[4 * r + 2] * n[2]);
+            }
+        }
+        if (wsum <= 0) continue;
+        float len = std::sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+        uint32_t packed = 0;
+        for (int r = 0; r < 3; r++) {
+            g.pos[3 * v + r] = np[r] / wsum;
+            float f = len > 1e-6f ? nn[r] / len : 0.0f;
+            packed |= (uint32_t)(uint8_t)(int8_t)std::lround(f * 127.0f) << (8 * r);
+        }
+        g.normal[v] = packed;
+    }
+    return g;
+}
+
+// Character meshes are kits: every group is one part (head, torso, legs, hair, LODs...). Merges the chosen groups
+// (skinned into `pose`) into one group and returns the materials of their submeshes.
+static oc::MeshGroup mergeParts(const oc::Mesh& m, const oc::Pose* pose, const std::vector<int>& parts, const std::map<int, std::string>& override, std::vector<std::string>& mats) {
+    oc::MeshGroup out;
+    std::vector<size_t> firstSub(m.groups.size() + 1, 0);
+    for (size_t i = 0; i < m.groups.size(); i++) firstSub[i + 1] = firstSub[i] + m.groups[i].counts.size();
+    for (int gi : parts) {
+        if (gi < 0 || (size_t)gi >= m.groups.size()) continue;
+        oc::MeshGroup g = skinGroup(m, pose, (size_t)gi);
+        uint32_t base = (uint32_t)(out.pos.size() / 3);
+        out.pos.insert(out.pos.end(), g.pos.begin(), g.pos.end());
+        out.uv.resize(out.pos.size() / 3 * 2, 0.0f);
+        if (!g.uv.empty()) std::copy(g.uv.begin(), g.uv.end(), out.uv.end() - g.uv.size());
+        out.normal.resize(out.pos.size() / 3, 0);
+        if (!g.normal.empty()) std::copy(g.normal.begin(), g.normal.end(), out.normal.end() - g.normal.size());
+        for (uint32_t i : g.index) out.index.push_back(base + i);
+        out.counts.insert(out.counts.end(), g.counts.begin(), g.counts.end());
+        auto ov = override.find(gi);
+        for (size_t k = 0; k < g.counts.size(); k++) mats.push_back(ov != override.end() ? ov->second : k < g.material.size() && g.material[k] < m.materials.size() ? m.materials[g.material[k]] : std::string());
+    }
+    return out;
 }
 
 static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
@@ -107,25 +168,27 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
         exit(1);
     }
     w.objects = oc::parseSobj(blob);
+    if (w.nomap) w.objects.instances.clear();
     {
         std::vector<uint8_t> exp;
         if (oc::readZipEntry((dw / "Data2.pak").string(), "data/maps/" + map + "/" + map + ".exp", exp)) w.lights = oc::parseLights(exp);
         printf("%zu lights from .exp\n", w.lights.size());
     }
     static std::vector<std::unique_ptr<oc::Pack>> packs;
-    std::map<std::string, std::pair<oc::Pack*, const oc::Resource*>> index;
+    std::map<std::string, std::pair<oc::Pack*, const oc::Resource*>> index, clips;
     for (auto& e : fs::directory_iterator(dw / "Data")) {
         if (e.path().extension() != ".rpack") continue;
         try { packs.push_back(std::make_unique<oc::Pack>(e.path().string())); } catch (std::exception&) { continue; }
         for (auto& r : packs.back()->resources()) {
-            if (r.flags == oc::TYPE_MESH) index.emplace(r.name, std::make_pair(packs.back().get(), &r));
+            if (r.flags == 0x01400001) clips.emplace(r.name, std::make_pair(packs.back().get(), &r));
+            else if (r.flags == oc::TYPE_MESH) index.emplace(r.name, std::make_pair(packs.back().get(), &r));
             else if (r.flags == oc::TYPE_TEXTURE_2D || r.flags == oc::TYPE_TEXTURE_CUBE) w.textures.emplace(r.name, std::make_pair(packs.back().get(), &r));
         }
     }
     try { w.db = std::make_unique<oc::MaterialDb>((dw / "Data" / "optimized_dx11.mp").string()); } catch (std::exception& ex) { fprintf(stderr, "materials: %s\n", ex.what()); }
     w.mats.push_back({"", "", 0, 1});
     // far terrain ("terrain_horizon") meshes are baked in world space and not listed in the .sobj: add them at the origin
-    {
+    if (!w.nomap) {
         std::string pre1 = map + "_terrain_horizon", pre2 = map == "old_town" ? "ot_terrain_horizon" : std::string("?");
         for (auto& kv : index) {
             if (kv.first.rfind(pre1, 0) != 0 && kv.first.rfind(pre2, 0) != 0) continue;
@@ -136,6 +199,18 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
             w.objects.instances.push_back(in);
         }
     }
+    for (size_t k = 0; k < w.spawns.size(); k++) {
+        const Spawn& s = w.spawns[k];
+        oc::Instance in{};
+        in.scale[0] = in.scale[1] = in.scale[2] = 1.0f;
+        float h = s.yaw * 3.14159265f / 360.0f;
+        in.quat[1] = (int16_t)std::lround(std::sin(h) * 32767); in.quat[3] = (int16_t)std::lround(std::cos(h) * 32767);
+        memcpy(in.pos, s.pos, 12);
+        in.tag = 0xffff;
+        in.type = (uint16_t)w.objects.types.size();
+        w.objects.types.push_back({"spawn#" + std::to_string(k), "Default", "", 0});
+        w.objects.instances.push_back(in);
+    }
     w.geom.resize(w.objects.types.size());
     std::vector<char> used(w.objects.types.size(), 0);
     for (auto& i : w.objects.instances) used[i.type] = 1;
@@ -143,6 +218,37 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
     for (size_t t = 0; t < w.objects.types.size(); t++) {
         if (!used[t] || skipType(w.objects.types[t].mesh)) continue;
         std::string name = w.objects.types[t].mesh;
+        if (name.rfind("spawn#", 0) == 0) {
+            const Spawn& s = w.spawns[std::stoul(name.substr(6))];
+            auto mi = index.find(s.mesh);
+            if (mi == index.end()) { fprintf(stderr, "spawn: mesh %s not found\n", s.mesh.c_str()); continue; }
+            oc::Mesh m;
+            if (!oc::loadMesh(*mi->second.first, *mi->second.second, m) || m.groups[0].index.empty()) { fprintf(stderr, "spawn: %s does not decode\n", s.mesh.c_str()); continue; }
+            oc::Pose pose;
+            bool havePose = false;
+            auto ci = clips.find(s.clip);
+            if (ci != clips.end()) havePose = oc::loadStaticPose(*ci->second.first, *ci->second.second, pose);
+            printf("spawn %s: %zu bones, skinned=%d, clip %s %s\n", s.mesh.c_str(), m.skeleton.names.size(), (int)!m.groups[0].boneIdx.empty(), s.clip.c_str(), havePose ? "static pose" : "bind pose");
+            TypeGeom& g = w.geom[t];
+            g.valid = true;
+            if (s.parts.empty()) {
+                size_t sub = 0;
+                for (size_t gi = 0; gi < m.groups.size(); gi++) {
+                    const auto& pg = m.groups[gi];
+                    float lo = 1e9f, hi = -1e9f;
+                    for (size_t v = 0; v < pg.pos.size() / 3; v++) { lo = std::min(lo, pg.pos[3 * v + 1]); hi = std::max(hi, pg.pos[3 * v + 1]); }
+                    printf("  part %zu: %zu verts y %.2f..%.2f %s\n", gi, pg.pos.size() / 3, lo, hi, !pg.material.empty() && pg.material[0] < m.materials.size() ? m.materials[pg.material[0]].c_str() : "?");
+                    sub += pg.counts.size();
+                }
+            }
+            std::vector<std::string> partMats;
+            oc::MeshGroup mg = mergeParts(m, havePose ? &pose : nullptr, s.parts.empty() ? std::vector<int>{0} : s.parts, s.partMat, partMats);
+            appendGroup(w, mg, partMats, g.vertexOffset[0], g.subs[0]);
+            g.vertexOffset[1] = g.vertexOffset[0];
+            g.subs[1] = g.subs[0];
+            ok++;
+            continue;
+        }
         if (name.size() > 4 && name.substr(name.size() - 4) == ".msh") name.resize(name.size() - 4);
         auto it = index.find(name);
         if (it == index.end()) continue;
@@ -409,6 +515,7 @@ struct Draw { uint32_t indexCount, instanceCount, firstIndex; int32_t vertexOffs
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: oc_viewer <DW dir> [map] [--shot out.ppm] [--cam x y z yaw pitch] [--radius R]\n"); return 1; }
     fs::path dw = argv[1];
+    World world;
     std::string map = "old_town", shot;
     glm::vec3 camPos(300, 70, 100);
     float yaw = 0.0f, pitch = -0.25f, radius = 450.0f, hour = 15.0f;
@@ -416,12 +523,21 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--shot" && i + 1 < argc) shot = argv[++i];
         else if (a == "--radius" && i + 1 < argc) radius = (float)atof(argv[++i]);
+        else if (a == "--spawn" && i + 6 < argc) { world.spawns.push_back({argv[i + 1], argv[i + 2], {(float)atof(argv[i + 3]), (float)atof(argv[i + 4]), (float)atof(argv[i + 5])}, (float)atof(argv[i + 6])}); i += 6; }
+        else if (a == "--nomap") world.nomap = true;
+        else if (a == "--parts" && i + 1 < argc && !world.spawns.empty()) {
+            // list of part[=material.mat]
+            for (char* tok = strtok(argv[++i], ","); tok; tok = strtok(nullptr, ",")) {
+                int part = atoi(tok);
+                world.spawns.back().parts.push_back(part);
+                if (const char* eq = strchr(tok, '=')) world.spawns.back().partMat[part] = eq + 1;
+            }
+        }
         else if (a == "--time" && i + 1 < argc) hour = (float)atof(argv[++i]);
         else if (a == "--cam" && i + 5 < argc) { camPos = {(float)atof(argv[i + 1]), (float)atof(argv[i + 2]), (float)atof(argv[i + 3])}; yaw = (float)atof(argv[i + 4]); pitch = (float)atof(argv[i + 5]); i += 5; }
         else if (a[0] != '-') map = a;
     }
 
-    World world;
     loadWorld(dw, map, world);
 
     SDL_Init(SDL_INIT_VIDEO);
