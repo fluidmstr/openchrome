@@ -8,7 +8,7 @@ FetchContent_Declare(zlib URL https://github.com/madler/zlib/archive/refs/tags/v
 set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zlib)
 
-add_library(oc_core src/core/rpack.cpp src/core/mesh.cpp src/core/sobj.cpp src/core/zip.cpp src/core/mp.cpp src/core/texture.cpp)
+add_library(oc_core src/core/rpack.cpp src/core/mesh.cpp src/core/sobj.cpp src/core/zip.cpp src/core/mp.cpp src/core/texture.cpp src/core/exp.cpp)
 target_include_directories(oc_core PUBLIC src ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
 target_link_libraries(oc_core PUBLIC zlibstatic)
 if(MSVC)
@@ -30,7 +30,7 @@ if((DEFINED ENV{VULKAN_SDK} OR EXISTS "C:/VulkanSDK") AND EXISTS "${CMAKE_SOURCE
   target_link_directories(oc_viewer PRIVATE "${VK_SDK}/Lib")
   target_link_libraries(oc_viewer oc_core vulkan-1 SDL2 SDL2main)
   find_program(GLSLC glslc HINTS "${VK_SDK}/Bin")
-  foreach(s mesh.vert mesh.frag shadow.vert)
+  foreach(s mesh.vert mesh.frag shadow.vert glow.vert glow.frag)
     add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/${s}.spv
       COMMAND ${GLSLC} ${CMAKE_SOURCE_DIR}/shaders/${s} -o ${CMAKE_BINARY_DIR}/${s}.spv
       DEPENDS ${CMAKE_SOURCE_DIR}/shaders/${s})

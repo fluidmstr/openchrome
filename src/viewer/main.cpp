@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "core/exp.hpp"
 #include "core/mesh.hpp"
 #include "core/mp.hpp"
 #include "core/texture.hpp"
@@ -38,6 +39,7 @@ struct Sub { uint32_t first, count, mat; };
 
 struct TypeGeom {
     bool valid = false;
+    float emissive = 0.0f;  // night glow strength, from the surface name ("emissive_no_shadow" window plugs, "*_ems")
     int32_t vertexOffset[2] = {0, 0};
     std::vector<Sub> subs[2];  // per LOD (0 = near, 1 = far)
 };
@@ -53,6 +55,7 @@ struct World {
     std::vector<MatInfo> mats;       // material 0 is "no material"
     std::map<std::string, uint32_t> matIndex;
     oc::StaticObjects objects;
+    std::vector<oc::Light> lights;
     std::map<std::string, std::pair<oc::Pack*, const oc::Resource*>> textures;
     std::unique_ptr<oc::MaterialDb> db;
 };
@@ -104,6 +107,11 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
         exit(1);
     }
     w.objects = oc::parseSobj(blob);
+    {
+        std::vector<uint8_t> exp;
+        if (oc::readZipEntry((dw / "Data2.pak").string(), "data/maps/" + map + "/" + map + ".exp", exp)) w.lights = oc::parseLights(exp);
+        printf("%zu lights from .exp\n", w.lights.size());
+    }
     static std::vector<std::unique_ptr<oc::Pack>> packs;
     std::map<std::string, std::pair<oc::Pack*, const oc::Resource*>> index;
     for (auto& e : fs::directory_iterator(dw / "Data")) {
@@ -143,6 +151,13 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
         if (m.groups[0].index.empty()) continue;
         TypeGeom& g = w.geom[t];
         g.valid = true;
+        {
+            std::string sfc = w.objects.types[t].surface;
+            for (auto& c : sfc) c = (char)tolower((unsigned char)c);
+            if (sfc.find("emissive") != std::string::npos) g.emissive = 1.0f;
+            else if (sfc.find("ems_strong") != std::string::npos) g.emissive = 1.5f;
+            else if (sfc.find("ems") != std::string::npos) g.emissive = 0.5f;
+        }
         appendGroup(w, m.groups[0], m.materials, g.vertexOffset[0], g.subs[0]);
         // far LOD: last group, but only when the groups really are a LOD chain (vertex counts shrink)
         size_t last = m.groups.size() - 1;
@@ -255,6 +270,7 @@ static void createSwapchain(Gfx& g) {
     VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps));
     int w, h;
     SDL_Vulkan_GetDrawableSize(g.window, &w, &h);
+    if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) { SDL_Delay(50); VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps)); }
     g.extent = caps.currentExtent.width != 0xffffffff ? caps.currentExtent
              : VkExtent2D{std::clamp<uint32_t>(w, caps.minImageExtent.width, caps.maxImageExtent.width),
                           std::clamp<uint32_t>(h, caps.minImageExtent.height, caps.maxImageExtent.height)};
@@ -380,7 +396,13 @@ static GpuTex createTexture(Gfx& g, const oc::Texture& tex) {
 
 constexpr uint32_t MAX_TEX = 4096;
 constexpr uint32_t SHADOW_RES = 4096;
-struct FrameUbo { glm::mat4 lightVP; glm::vec4 sun; glm::vec4 params; };  // 96 bytes, one 256-byte slot per frame in flight
+struct FrameUbo {  // 176 bytes, one 256-byte slot per frame in flight (mirrors `Frame` in the shaders)
+    glm::mat4 lightVP;
+    glm::vec4 sunDir, sunColor /* w = lamps on (0..1) */, skyColor, groundColor, fogColor;
+    glm::vec4 params;   // x = shadow texel, yz = light grid origin xz, w = cell size
+    glm::vec4 params2;  // x = grid w, y = grid h, z = light count, w = exposure
+};
+struct GpuLight { glm::vec4 posRadius, colorIntensity; };
 
 struct Draw { uint32_t indexCount, instanceCount, firstIndex; int32_t vertexOffset; uint32_t firstInstance, mat; };
 
@@ -389,11 +411,12 @@ int main(int argc, char** argv) {
     fs::path dw = argv[1];
     std::string map = "old_town", shot;
     glm::vec3 camPos(300, 70, 100);
-    float yaw = 0.0f, pitch = -0.25f, radius = 450.0f;
+    float yaw = 0.0f, pitch = -0.25f, radius = 450.0f, hour = 15.0f;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--shot" && i + 1 < argc) shot = argv[++i];
         else if (a == "--radius" && i + 1 < argc) radius = (float)atof(argv[++i]);
+        else if (a == "--time" && i + 1 < argc) hour = (float)atof(argv[++i]);
         else if (a == "--cam" && i + 5 < argc) { camPos = {(float)atof(argv[i + 1]), (float)atof(argv[i + 2]), (float)atof(argv[i + 3])}; yaw = (float)atof(argv[i + 4]); pitch = (float)atof(argv[i + 5]); i += 5; }
         else if (a[0] != '-') map = a;
     }
@@ -519,6 +542,45 @@ int main(int argc, char** argv) {
     }
     uint32_t nextSlot = 1;
 
+    // point lights from the .exp, bucketed into a 16 m grid so the fragment shader only loops over nearby lights
+    std::vector<GpuLight> gpuLights;
+    for (const oc::Light& l : world.lights) {
+        float r = std::clamp(std::max({l.scale[0], l.scale[1], l.scale[2]}) * 0.55f, 3.0f, 40.0f);
+        gpuLights.push_back({glm::vec4(l.pos[0], l.pos[1], l.pos[2], r), glm::vec4(l.color[0], l.color[1], l.color[2], l.intensity)});
+    }
+    const float cellSize = 16.0f;
+    float gMinX = 0, gMinZ = 0;
+    int gridW = 1, gridH = 1;
+    std::vector<uint32_t> cellStart{0, 0}, cellIdx{0};
+    if (!gpuLights.empty()) {
+        float x0 = 1e9f, z0 = 1e9f, x1 = -1e9f, z1 = -1e9f;
+        for (auto& l : gpuLights) { x0 = std::min(x0, l.posRadius.x - l.posRadius.w); z0 = std::min(z0, l.posRadius.z - l.posRadius.w); x1 = std::max(x1, l.posRadius.x + l.posRadius.w); z1 = std::max(z1, l.posRadius.z + l.posRadius.w); }
+        gMinX = x0; gMinZ = z0;
+        gridW = (int)std::ceil((x1 - x0) / cellSize) + 1; gridH = (int)std::ceil((z1 - z0) / cellSize) + 1;
+        std::vector<std::vector<uint32_t>> cells((size_t)gridW * gridH);
+        for (uint32_t i = 0; i < gpuLights.size(); i++) {
+            const glm::vec4& p = gpuLights[i].posRadius;
+            int cx0 = (int)std::floor((p.x - p.w - gMinX) / cellSize), cx1 = (int)std::floor((p.x + p.w - gMinX) / cellSize);
+            int cz0 = (int)std::floor((p.z - p.w - gMinZ) / cellSize), cz1 = (int)std::floor((p.z + p.w - gMinZ) / cellSize);
+            for (int cz = cz0; cz <= cz1; cz++)
+                for (int cx = cx0; cx <= cx1; cx++) {
+                    auto& c = cells[(size_t)cz * gridW + cx];
+                    if (c.size() < 48) c.push_back(i);
+                }
+        }
+        cellStart.assign(cells.size() + 1, 0);
+        cellIdx.clear();
+        for (size_t c = 0; c < cells.size(); c++) { cellStart[c] = (uint32_t)cellIdx.size(); cellIdx.insert(cellIdx.end(), cells[c].begin(), cells[c].end()); }
+        cellStart[cells.size()] = (uint32_t)cellIdx.size();
+        if (cellIdx.empty()) cellIdx.push_back(0);
+    } else {
+        gpuLights.push_back({glm::vec4(0), glm::vec4(0)});
+    }
+    Buf lightBuf = uploadBuffer(g, gpuLights.data(), gpuLights.size() * sizeof(GpuLight), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buf cellBuf = uploadBuffer(g, cellStart.data(), cellStart.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buf idxBuf = uploadBuffer(g, cellIdx.data(), cellIdx.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const size_t numLights = world.lights.size();
+
     // shadow map + per-frame uniforms (descriptor set 1)
     VkImage shadowImg;
     VkDeviceMemory shadowMem;
@@ -546,16 +608,19 @@ int main(int argc, char** argv) {
     VkSampler shadowSampler;
     VK(vkCreateSampler(g.dev, &shs, nullptr, &shadowSampler));
     Buf frameUbo = makeBuffer(g, 256 * 2, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
-    VkDescriptorSetLayoutBinding sb[2] = {
+    VkDescriptorSetLayoutBinding sb[5] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sl.bindingCount = 2; sl.pBindings = sb;
+    sl.bindingCount = 5; sl.pBindings = sb;
     VkDescriptorSetLayout dsl1;
     VK(vkCreateDescriptorSetLayout(g.dev, &sl, nullptr, &dsl1));
-    VkDescriptorPoolSize dps1[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
+    VkDescriptorPoolSize dps1[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}};
     VkDescriptorPoolCreateInfo dpci1{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpci1.maxSets = 1; dpci1.poolSizeCount = 2; dpci1.pPoolSizes = dps1;
+    dpci1.maxSets = 1; dpci1.poolSizeCount = 3; dpci1.pPoolSizes = dps1;
     VkDescriptorPool dpool1;
     VK(vkCreateDescriptorPool(g.dev, &dpci1, nullptr, &dpool1));
     VkDescriptorSetAllocateInfo dsai1{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -565,10 +630,16 @@ int main(int argc, char** argv) {
     {
         VkDescriptorBufferInfo bi1{frameUbo.buf, 0, sizeof(FrameUbo)};
         VkDescriptorImageInfo ii1{shadowSampler, shadowView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet w1[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        VkDescriptorBufferInfo sbi[3] = {{lightBuf.buf, 0, VK_WHOLE_SIZE}, {cellBuf.buf, 0, VK_WHOLE_SIZE}, {idxBuf.buf, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet w1[5]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
+                                   {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        for (int k = 0; k < 3; k++) {
+            w1[2 + k].dstSet = dset1; w1[2 + k].dstBinding = 2 + k; w1[2 + k].descriptorCount = 1;
+            w1[2 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w1[2 + k].pBufferInfo = &sbi[k];
+        }
         w1[0].dstSet = dset1; w1[0].dstBinding = 0; w1[0].descriptorCount = 1; w1[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; w1[0].pBufferInfo = &bi1;
         w1[1].dstSet = dset1; w1[1].dstBinding = 1; w1[1].descriptorCount = 1; w1[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w1[1].pImageInfo = &ii1;
-        vkUpdateDescriptorSets(g.dev, 2, w1, 0, nullptr);
+        vkUpdateDescriptorSets(g.dev, 5, w1, 0, nullptr);
     }
 
     // pipeline
@@ -584,11 +655,11 @@ int main(int argc, char** argv) {
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fsm; stages[1].pName = "main";
     VkVertexInputBindingDescription binds[2] = {{0, 24, VK_VERTEX_INPUT_RATE_VERTEX}, {1, sizeof(GpuInstance), VK_VERTEX_INPUT_RATE_INSTANCE}};
-    VkVertexInputAttributeDescription attrs[6] = {
+    VkVertexInputAttributeDescription attrs[7] = {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32_SFLOAT, 12}, {2, 0, VK_FORMAT_R8G8B8A8_SNORM, 20},
-        {3, 1, VK_FORMAT_R32G32B32_SFLOAT, 0}, {4, 1, VK_FORMAT_R32G32B32_SFLOAT, 16}, {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32}};
+        {3, 1, VK_FORMAT_R32G32B32_SFLOAT, 0}, {4, 1, VK_FORMAT_R32G32B32_SFLOAT, 16}, {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32}, {6, 1, VK_FORMAT_R32_SFLOAT, 12}};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = binds; vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
+    vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = binds; vi.vertexAttributeDescriptionCount = 7; vi.pVertexAttributeDescriptions = attrs;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -629,6 +700,29 @@ int main(int argc, char** argv) {
         VK(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &sg, nullptr, &shadowPipeline));
     }
 
+    // light glow: one additive point sprite per light, positions read from the light buffer
+    VkPipeline glowPipeline;
+    {
+        VkShaderModule gvs = loadShader(g, exeDir + "glow.vert.spv"), gfs = loadShader(g, exeDir + "glow.frag.spv");
+        VkPipelineShaderStageCreateInfo gs[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+        gs[0].stage = VK_SHADER_STAGE_VERTEX_BIT; gs[0].module = gvs; gs[0].pName = "main";
+        gs[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; gs[1].module = gfs; gs[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo gvi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo gia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        gia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+        VkPipelineDepthStencilStateCreateInfo gds = ds;
+        gds.depthWriteEnable = VK_FALSE;
+        VkPipelineColorBlendAttachmentState gba{};
+        gba.blendEnable = VK_TRUE; gba.colorWriteMask = 0xF;
+        gba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE; gba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE; gba.colorBlendOp = VK_BLEND_OP_ADD;
+        gba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; gba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE; gba.alphaBlendOp = VK_BLEND_OP_ADD;
+        VkPipelineColorBlendStateCreateInfo gcb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        gcb.attachmentCount = 1; gcb.pAttachments = &gba;
+        VkGraphicsPipelineCreateInfo gg = gpi;
+        gg.pStages = gs; gg.pVertexInputState = &gvi; gg.pInputAssemblyState = &gia; gg.pDepthStencilState = &gds; gg.pColorBlendState = &gcb;
+        VK(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gg, nullptr, &glowPipeline));
+    }
+
     // frame resources
     VkCommandBuffer cmds[FRAMES];
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -667,6 +761,9 @@ int main(int argc, char** argv) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_RIGHTBRACKET) hour = std::fmod(hour + 0.5f, 24.0f);
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_LEFTBRACKET) hour = std::fmod(hour + 23.5f, 24.0f);
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_n) hour = (hour > 7.0f && hour < 18.0f) ? 22.0f : 14.0f;
             else if (e.type == SDL_MOUSEMOTION && SDL_GetRelativeMouseMode()) { yaw += e.motion.xrel * 0.0025f; pitch = std::clamp(pitch - e.motion.yrel * 0.0025f, -1.55f, 1.55f); }
             else if (e.type == SDL_MOUSEWHEEL) speed = std::clamp(speed * (e.wheel.y > 0 ? 1.25f : 0.8f), 2.0f, 2000.0f);
             else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) resized = true;
@@ -685,6 +782,11 @@ int main(int argc, char** argv) {
         if (k[SDL_SCANCODE_E]) camPos.y += sp * dt;
         if (k[SDL_SCANCODE_Q]) camPos.y -= sp * dt;
 
+        {
+            int dw_, dh_;
+            SDL_Vulkan_GetDrawableSize(g.window, &dw_, &dh_);
+            if (dw_ == 0 || dh_ == 0) { SDL_Delay(20); continue; }  // minimized: nothing to draw
+        }
         int fi = frame % FRAMES;
         VK(vkWaitForFences(g.dev, 1, &fences[fi], VK_TRUE, UINT64_MAX));
         uint32_t imgIdx;
@@ -718,6 +820,9 @@ int main(int argc, char** argv) {
             GpuInstance& o = dst[starts[visBucket[v]] + fill[visBucket[v]]++];
             memcpy(o.pos, in.pos, 12); memcpy(o.scale, in.scale, 12);
             for (int c = 0; c < 4; c++) o.quat[c] = in.quat[c] / 32767.0f;
+            // lit windows: a stable pseudo-random ~60% of the emissive plugs are on (the real on/off state is not decoded)
+            float lit = (((vis[v] * 2654435761u) >> 8) & 255) < 154 ? 1.0f : 0.0f;
+            o.p0 = world.geom[in.type].emissive * (world.geom[in.type].emissive == 1.0f ? lit : 1.0f);
         }
         draws.clear();
         for (size_t b = 0; b < nb; b++) {
@@ -728,7 +833,21 @@ int main(int argc, char** argv) {
         }
 
         // sun light matrix: one orthographic cascade around the camera, snapped to shadow texels
-        const glm::vec3 sunDir = glm::normalize(glm::vec3(0.45f, 0.75f, 0.35f));
+        // time of day: sun path over 6..18 h, a fixed dim moon otherwise; lamps fade in around dusk
+        const float el = (hour - 6.0f) / 12.0f * 3.14159265f;
+        const float sunH = std::sin(el);
+        const float day = glm::smoothstep(-0.08f, 0.2f, sunH);
+        const float az = 3.14159265f * (hour - 6.0f) / 12.0f;
+        const float ce = std::sqrt(std::max(0.0f, 1.0f - std::max(sunH, 0.12f) * std::max(sunH, 0.12f)));
+        const glm::vec3 sunV = glm::normalize(glm::vec3(std::cos(az) * ce, std::max(sunH, 0.12f), std::sin(az) * ce));
+        const glm::vec3 moonV = glm::normalize(glm::vec3(-0.4f, 0.6f, 0.5f));
+        const glm::vec3 sunDir = day > 0.35f ? sunV : moonV;
+        const glm::vec3 warm = glm::mix(glm::vec3(1.0f, 0.5f, 0.28f), glm::vec3(1.0f, 0.93f, 0.80f), glm::smoothstep(0.0f, 0.45f, sunH));
+        const glm::vec3 sunCol = glm::mix(glm::vec3(0.16f, 0.22f, 0.40f) * 0.5f, warm * 2.0f, day);
+        const glm::vec3 skyCol = glm::mix(glm::vec3(0.02f, 0.035f, 0.09f), glm::vec3(0.42f, 0.55f, 0.78f), day);
+        const glm::vec3 groundCol = glm::mix(glm::vec3(0.01f, 0.012f, 0.02f), glm::vec3(0.28f, 0.24f, 0.20f), day);
+        const glm::vec3 fogCol = glm::mix(glm::vec3(0.012f, 0.02f, 0.05f), glm::vec3(0.55f, 0.65f, 0.78f), day);
+        const float exposure = glm::mix(2.4f, 0.85f, day);
         const float S = 150.0f;
         glm::vec3 C = camPos + glm::vec3(fwd.x, 0.0f, fwd.z) * 70.0f;
         glm::mat4 lv = glm::lookAt(C + sunDir * 500.0f, C, glm::vec3(0, 1, 0));
@@ -770,7 +889,10 @@ int main(int argc, char** argv) {
         }
         {
             FrameUbo u;
-            u.lightVP = lightVP; u.sun = glm::vec4(sunDir, 1.0f); u.params = glm::vec4(1.0f / SHADOW_RES, 0, 0, 0);
+            u.lightVP = lightVP; u.sunDir = glm::vec4(sunDir, 1.0f); u.sunColor = glm::vec4(sunCol, 1.0f - day);
+            u.skyColor = glm::vec4(skyCol, 0); u.groundColor = glm::vec4(groundCol, 0); u.fogColor = glm::vec4(fogCol, 0);
+            u.params = glm::vec4(1.0f / SHADOW_RES, gMinX, gMinZ, cellSize);
+            u.params2 = glm::vec4((float)gridW, (float)gridH, (float)numLights, exposure);
             memcpy((uint8_t*)frameUbo.map + 256 * fi, &u, sizeof u);
         }
 
@@ -828,7 +950,7 @@ int main(int argc, char** argv) {
                      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
         VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         ca.imageView = g.views[imgIdx]; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE; ca.clearValue.color = {{0.72f, 0.80f, 0.88f, 1.0f}};
+        ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE; ca.clearValue.color = {{glm::mix(0.04f, 0.72f, day), glm::mix(0.06f, 0.80f, day), glm::mix(0.10f, 0.88f, day), 1.0f}};
         da.imageView = g.depthView; da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; da.clearValue.depthStencil = {1.0f, 0};
         VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -856,6 +978,11 @@ int main(int argc, char** argv) {
             pc.tex = (uint32_t)world.mats[d.mat].slot;
             vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
             vkCmdDrawIndexed(cmd, d.indexCount, d.instanceCount, d.firstIndex, d.vertexOffset, d.firstInstance);
+        }
+        if (numLights && day < 0.98f) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, glowPipeline);
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+            vkCmdDraw(cmd, (uint32_t)numLights, 1, 0, 0);
         }
         vkCmdEndRendering(cmd);
         bool takeShot = !shot.empty() && frame == 8;

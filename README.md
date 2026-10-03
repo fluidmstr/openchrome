@@ -14,7 +14,8 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6).
 - [~] animations: clip header + clip sets ([spec](docs/formats/anim.md)); track decoding and skeletons open
 - [x] map static objects ([spec](docs/formats/sobj.md), `tools/scene.py`): placements parsed, regions assemble correctly
 - [x] free-camera Vulkan viewer: textures, vertex normals, sun/sky lighting, shadow map, terrain chunks + horizon
-- [ ] material templates (real colours), skeletal animation, sky, vegetation (`.to`), gameplay entities (`.exp`)
+- [x] normals, sun/moon lighting, shadows, night lamps and lit windows from `.exp` lights ([spec](docs/formats/exp.md))
+- [ ] material templates (real colours), skeletal animation, sky, vegetation (`.to`), other `.exp` entities
 - [ ] gameplay
 
 Unofficial fan project, not affiliated with Techland. Dying Light is a trademark of its owners.
@@ -25,5 +26,5 @@ Unofficial fan project, not affiliated with Techland. Dying Light is a trademark
 build.bat                     # CMake + NMake, output in buildbuild\oc_viewer.exe "F:\SteamLibrary\steamapps\common\Dying Light\DW" old_town
 ```
 
-WASD fly, mouse look, Q/E down/up, Shift/Ctrl speed, wheel changes speed, Esc quits. `--shot out.ppm --cam x y z yaw pitch` writes a screenshot. `oc_probe` decodes all meshes of a map as a smoke test.
+WASD fly, mouse look, Q/E down/up, Shift/Ctrl speed, wheel changes speed, Esc quits, `[` `]` shift time of day, `N` toggles day/night (`--time H` sets the hour). `--shot out.ppm --cam x y z yaw pitch` writes a screenshot. `oc_probe` decodes all meshes of a map as a smoke test.
 

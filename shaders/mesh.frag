@@ -2,12 +2,21 @@
 
 layout(set = 0, binding = 0) uniform sampler2D textures[4096];
 
-layout(set = 1, binding = 0) uniform Frame { mat4 lightVP; vec4 sun; vec4 params; } frame;
+layout(set = 1, binding = 0) uniform Frame {
+    mat4 lightVP;
+    vec4 sunDir, sunColor, skyColor, groundColor, fogColor;
+    vec4 params;   // x shadow texel, yz light grid origin, w cell size
+    vec4 params2;  // x grid w, y grid h, z light count, w exposure
+} frame;
 layout(set = 1, binding = 1) uniform sampler2DShadow shadowMap;
+layout(std430, set = 1, binding = 2) readonly buffer Lights { vec4 L[]; } lights;
+layout(std430, set = 1, binding = 3) readonly buffer Cells { uint start[]; } cells;
+layout(std430, set = 1, binding = 4) readonly buffer Idx { uint v[]; } lidx;
 
 layout(location = 0) in vec3 wpos;
 layout(location = 1) in vec2 uv;
 layout(location = 2) in vec3 wnormal;
+layout(location = 3) in float emissive;
 layout(location = 0) out vec4 outColor;
 
 layout(push_constant) uniform PC {
@@ -29,17 +38,40 @@ float shadowFactor(vec3 N) {
     return s / 9.0;
 }
 
+// point lights from the map: only the lights registered in this 16 m grid cell are visited
+vec3 pointLights(vec3 N) {
+    ivec2 c = ivec2(floor((wpos.xz - frame.params.yz) / frame.params.w));
+    int gw = int(frame.params2.x), gh = int(frame.params2.y);
+    if (c.x < 0 || c.y < 0 || c.x >= gw || c.y >= gh) return vec3(0.0);
+    uint cell = uint(c.y * gw + c.x);
+    vec3 acc = vec3(0.0);
+    for (uint k = cells.start[cell]; k < cells.start[cell + 1]; k++) {
+        uint li = lidx.v[k];
+        vec4 a = lights.L[2 * li], b = lights.L[2 * li + 1];
+        vec3 d = a.xyz - wpos;
+        float d2 = dot(d, d), R = a.w;
+        if (d2 > R * R) continue;
+        float dist = sqrt(d2);
+        float w = clamp(1.0 - pow(dist / R, 4.0), 0.0, 1.0);
+        float att = w * w / (d2 + 1.0);
+        float ndl = max(dot(N, d / max(dist, 1e-3)), 0.0) * 0.8 + 0.2;
+        acc += b.rgb * min(b.w, 4.0) * att * ndl;
+    }
+    return acc * 14.0;
+}
+
 void main() {
     // meshes without decoded normals fall back to the flat normal from screen-space derivatives
     vec3 N = dot(wnormal, wnormal) > 0.01 ? normalize(wnormal) : normalize(cross(dFdx(wpos), dFdy(wpos)));
-    vec3 sunDir = frame.sun.xyz;
-    float ndl = max(dot(N, sunDir), 0.0) * shadowFactor(N);
-    vec3 skyCol = vec3(0.42, 0.55, 0.78), groundCol = vec3(0.28, 0.24, 0.20);
-    vec3 hemi = mix(groundCol, skyCol, N.y * 0.5 + 0.5);
+    float ndl = max(dot(N, frame.sunDir.xyz), 0.0) * shadowFactor(N);
+    vec3 hemi = mix(frame.groundColor.rgb, frame.skyColor.rgb, N.y * 0.5 + 0.5);
     vec3 albedo = pow(texture(textures[pc.tex], uv).rgb, vec3(2.2));
-    vec3 col = albedo * (hemi * 0.7 + vec3(1.0, 0.93, 0.80) * 2.0 * ndl);
+    vec3 col = albedo * (hemi * 0.7 + frame.sunColor.rgb * ndl);
+    col += albedo * pointLights(N) * frame.sunColor.w;
+    // lit windows / glowing signs after dusk
+    col += mix(albedo, vec3(1.0, 0.72, 0.42), 0.55) * emissive * 2.2 * frame.sunColor.w;
     float d = distance(wpos, pc.cam.xyz);
     float fog = 1.0 - exp(-d * pc.cam.w);
-    col = mix(col, vec3(0.55, 0.65, 0.78), clamp(fog, 0.0, 1.0));
-    outColor = vec4(pow(aces(col * 0.85), vec3(1.0 / 2.2)), 1.0);
+    col = mix(col, frame.fogColor.rgb, clamp(fog, 0.0, 1.0));
+    outColor = vec4(pow(aces(col * frame.params2.w), vec3(1.0 / 2.2)), 1.0);
 }
