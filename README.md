@@ -13,7 +13,8 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6).
 - [x] materials + texture binding ([spec](docs/formats/mp.md), `tools/export_model.py`)
 - [~] animations: clip header + clip sets ([spec](docs/formats/anim.md)); track decoding and skeletons open
 - [x] map static objects ([spec](docs/formats/sobj.md), `tools/scene.py`): placements parsed, regions assemble correctly
-- [ ] terrain, lighting, free camera viewer
+- [x] free-camera Vulkan viewer: textures, vertex normals, sun/sky lighting, shadow map, terrain chunks + horizon
+- [ ] material templates (real colours), skeletal animation, sky, vegetation (`.to`), gameplay entities (`.exp`)
 - [ ] gameplay
 
 Unofficial fan project, not affiliated with Techland. Dying Light is a trademark of its owners.

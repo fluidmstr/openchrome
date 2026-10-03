@@ -58,7 +58,7 @@ struct World {
 };
 
 static bool skipType(const std::string& mesh) {
-    static const char* skip[] = {"blood", "decal", "dummy", "dead_body", "trigger", "collision", "physics"};
+    static const char* skip[] = {"blood", "decal", "dummy", "dead_body", "trigger", "collision", "physics", "occluder", "light_shaft"};
     std::string l = mesh;
     for (auto& c : l) c = (char)tolower((unsigned char)c);
     for (auto s : skip) if (l.find(s) != std::string::npos) return true;
@@ -116,6 +116,18 @@ static void loadWorld(const fs::path& dw, const std::string& map, World& w) {
     }
     try { w.db = std::make_unique<oc::MaterialDb>((dw / "Data" / "optimized_dx11.mp").string()); } catch (std::exception& ex) { fprintf(stderr, "materials: %s\n", ex.what()); }
     w.mats.push_back({"", "", 0, 1});
+    // far terrain ("terrain_horizon") meshes are baked in world space and not listed in the .sobj: add them at the origin
+    {
+        std::string pre1 = map + "_terrain_horizon", pre2 = map == "old_town" ? "ot_terrain_horizon" : std::string("?");
+        for (auto& kv : index) {
+            if (kv.first.rfind(pre1, 0) != 0 && kv.first.rfind(pre2, 0) != 0) continue;
+            oc::Instance in{};
+            in.scale[0] = in.scale[1] = in.scale[2] = 1.0f; in.quat[3] = 32767; in.tag = 0xffff;
+            in.type = (uint16_t)w.objects.types.size();
+            w.objects.types.push_back({kv.first + ".msh", "Default", "", 0});
+            w.objects.instances.push_back(in);
+        }
+    }
     w.geom.resize(w.objects.types.size());
     std::vector<char> used(w.objects.types.size(), 0);
     for (auto& i : w.objects.instances) used[i.type] = 1;
@@ -694,7 +706,7 @@ int main(int argc, char** argv) {
             if (!tg.valid) continue;
             glm::vec3 d(in.pos[0] - camPos.x, in.pos[1] - camPos.y, in.pos[2] - camPos.z);
             float d2 = glm::dot(d, d);
-            if (d2 > r2 || glm::dot(d, fwd) < -40.0f) continue;
+            if (in.tag != 0xffff && (d2 > r2 || glm::dot(d, fwd) < -40.0f)) continue;
             uint32_t b = in.type * 2 + (d2 > lodDist2 ? 1 : 0);
             vis.push_back((uint32_t)i); visBucket.push_back(b); counts[b]++;
         }
@@ -734,7 +746,7 @@ int main(int argc, char** argv) {
             const oc::Instance& in = world.objects.instances[i];
             if (!world.geom[in.type].valid) continue;
             glm::vec3 d(in.pos[0] - C.x, in.pos[1] - C.y, in.pos[2] - C.z);
-            if (glm::dot(d, d) > sr2) continue;
+            if (in.tag == 0xffff || glm::dot(d, d) > sr2) continue;  // horizon terrain casts no shadow
             glm::vec3 dc(in.pos[0] - camPos.x, in.pos[1] - camPos.y, in.pos[2] - camPos.z);
             uint32_t b = in.type * 2 + (glm::dot(dc, dc) > lodDist2 ? 1 : 0);
             vis2.push_back((uint32_t)i); visBucket2.push_back(b); counts2[b]++;
@@ -828,10 +840,10 @@ int main(int argc, char** argv) {
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &sc);
         struct { glm::mat4 vp; glm::vec4 cam; uint32_t tex; uint32_t pad[3]; } pc{};
-        glm::mat4 proj = glm::perspective(glm::radians(65.0f), (float)g.extent.width / (float)g.extent.height, 0.3f, radius * 2.0f);
+        glm::mat4 proj = glm::perspective(glm::radians(65.0f), (float)g.extent.width / (float)g.extent.height, 0.3f, std::max(radius * 2.0f, 20000.0f));
         proj[1][1] *= -1.0f;
         pc.vp = proj * glm::lookAt(camPos, camPos + fwd, glm::vec3(0, 1, 0));
-        pc.cam = glm::vec4(camPos, 2.5f / radius);
+        pc.cam = glm::vec4(camPos, 1.2f / radius);
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
         VkBuffer vbs[2] = {vbuf.buf, inst[fi].buf};
         VkDeviceSize offs[2] = {0, 0};
