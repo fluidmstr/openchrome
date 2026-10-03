@@ -12,7 +12,8 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6).
 - [x] static meshes -> OBJ ([spec](docs/formats/mesh.md), `tools/mesh.py`)
 - [x] materials + texture binding ([spec](docs/formats/mp.md), `tools/export_model.py`)
 - [~] animations: clip header + clip sets ([spec](docs/formats/anim.md)); track decoding and skeletons open
-- [ ] map loading + free camera
+- [x] map static objects ([spec](docs/formats/sobj.md), `tools/scene.py`): placements parsed, regions assemble correctly
+- [ ] terrain, lighting, free camera viewer
 - [ ] gameplay
 
 Unofficial fan project, not affiliated with Techland. Dying Light is a trademark of its owners.
