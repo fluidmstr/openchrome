@@ -28,16 +28,16 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6), wri
 | Animation tracks (bit-packed ANM2 streams) | in progress |
 | Terrain layer blending, sky, vegetation, navmesh, gameplay | open |
 
-<img src="docs/img/characters.jpg" align="right" width="42%" alt="Skinned character in bind pose and two clip poses">
+<img src="docs/img/characters.jpg" align="right" width="42%" alt="Textured character in bind pose and in a clip pose">
 
 ### Characters
 
-Character meshes are skinned kits (head, torso, legs, hair and their LODs as separate groups). The viewer reads the skeleton stored in the mesh, the per-submesh bone palettes and the vertex weights, then applies a pose from a static animation clip (here: T-pose, an NPC reset pose and a death pose). Textures for characters are not bound yet.
+Character meshes are skinned kits (head, torso, legs, hair and their LODs as separate groups). The viewer reads the skeleton stored in the mesh, the per-submesh bone palettes and the vertex weights, then applies a pose from a static animation clip (here: bind pose and an NPC reset pose). Skin, clothes and faces use the textures bound by their materials; the colour-grading masks (`s_grd`, `s_idx`), so the clothes are still undyed, and the normal and specular maps are not applied yet.
 
 ```
 oc_viewer "<DW dir>" old_town --nomap ^
   --spawn survivor_woman_a m_npc_reset_anim 0 0 0 0 ^
-  --parts 0=survivor_woman_head_b.mat,16=survivor_woman_torso_b.mat,2=survivor_woman_legs_b.mat
+  --parts 53=survivor_woman_head_b.mat,116=survivor_woman_torso_b.mat,88=survivor_woman_legs_b.mat
 ```
 
 <br clear="right">
