@@ -8,7 +8,7 @@ FetchContent_Declare(zlib URL https://github.com/madler/zlib/archive/refs/tags/v
 set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zlib)
 
-add_library(oc_core src/core/rpack.cpp src/core/mesh.cpp src/core/sobj.cpp src/core/zip.cpp src/core/mp.cpp src/core/texture.cpp src/core/exp.cpp src/core/skin.cpp src/core/script.cpp)
+add_library(oc_core src/core/rpack.cpp src/core/mesh.cpp src/core/sobj.cpp src/core/zip.cpp src/core/mp.cpp src/core/texture.cpp src/core/exp.cpp src/core/skin.cpp src/core/script.cpp src/core/quest.cpp)
 target_include_directories(oc_core PUBLIC src ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
 target_link_libraries(oc_core PUBLIC zlibstatic)
 if(MSVC)
@@ -19,6 +19,8 @@ add_executable(oc_probe src/tools/probe.cpp)
 target_link_libraries(oc_probe oc_core)
 add_executable(oc_scrstat src/tools/scrstat.cpp)
 target_link_libraries(oc_scrstat oc_core)
+add_executable(oc_queststat src/tools/queststat.cpp)
+target_link_libraries(oc_queststat oc_core)
 
 # Viewer needs the Vulkan SDK (VULKAN_SDK env) which also ships SDL2 and glslc.
 if((DEFINED ENV{VULKAN_SDK} OR EXISTS "C:/VulkanSDK") AND EXISTS "${CMAKE_SOURCE_DIR}/src/viewer/main.cpp")
