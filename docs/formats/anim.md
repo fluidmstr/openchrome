@@ -29,3 +29,15 @@ Animated clips (not decoded): after the header come `X` bytes of per-animated-ch
 Skinned mesh resources (`player_*`, 89-216 bones) carry the skeleton in the meta chunk (role 0x10): the type-2 object (`a` = bone count) is the NUL-separated bone-name string table; bone nodes are 208-byte records from offset 0x90: name pointer at +136 (string offset + 1), local 3x4 matrix at +16, inverse-bind 3x4 at +64 (column vectors `[R|t]`, floats). The parent is not stored: it is the earlier bone p with `inverse(invBind[p]) * local[k] == inverse(invBind[k])` (error < 1e-6 for all tested bones). Name hashes match the clip bone hashes.
 
 `tools/anim.py <pack> [filter]` prints clip headers and set record counts.
+
+## Animated tracks: findings so far (not decoded)
+
+Worked through `m_fpp_lowstamina` (51 frames, 80 bones, 3 animated channels).
+
+Verified:
+- Payload layout: 48-byte header+u16 table, then `X = 64*ceil(animated/8)` bytes of per-channel parameters (8 float bases, then 8 float scales per group of 8 channels; unused lanes 0; the scale lane is `2.0e-5` = `0x37a7c5ac` for used lanes here), then `static` floats, then the bit-packed stream (`0xff` padding, then blocks).
+- Table at u16 offset 14..: `[1?, block offsets..., 0, 0, static, animated, bones*9, X]`; the block offsets (191, 196, 202, 208, 212) are in 16-byte units, one per block of ~10 frames (5 blocks for 51 frames), and their differences equal the block sizes in 16-byte units.
+- The static floats are bone-major with the animated channels left out: in this clip bone 26 stores 6 floats (position + scale), so the 3 animated channels are its quaternion xyz; the bases (0.319, -0.319, -0.340) are close to the neighbouring bone's quaternion (0.333, -0.333, -0.333). Channel positions can be found by looking for bones whose static group is short.
+- Stream block = 16-byte header (8 u16) + N rows of 16 bytes; a row holds one u16 per animated channel (lane = channel within its group of 8, unused lanes zero). N varies per block (4, 5, 5, 3).
+
+Rejected: bit-plane decoding of the rows (rows as bit planes of 16 frames) gives noisy values; rows as raw u16 samples scaled by `2e-5` leave the quaternion range. Open: meaning of the block header words (`f4fe 8301 33ff 3480 4380 4380 3380 3380`), and whether rows are spline control points or delta/entropy coded samples. A second clip with a single animated channel is the next best probe.
