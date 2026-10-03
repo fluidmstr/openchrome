@@ -47,3 +47,7 @@ Seen type flags (count over 38 packs): `0x01400001` 10318, `0x01100005` 5254 (me
 ## Tool
 
 `tools/rpack.py ls <pack>` lists resources and per-stream sizes; `tools/rpack.py x <pack> <dir>` extracts the parts.
+
+## Runtime access
+
+`oc::Pack` memory-maps raw streams directly and inflates compressed ones once into an on-disk cache (`$RPACK_CACHE`, default `out/cache`, `<pack>.<packsize>.<stream>`, shared with `tools/rpack.py`), which is then memory-mapped; chunks are views into the mapping, so RAM use follows the pages actually touched.

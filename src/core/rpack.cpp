@@ -2,6 +2,18 @@
 
 #include <zlib.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -57,66 +69,111 @@ static std::string cachePath(const std::string& pack, size_t i) {
     return (dir / (fs::path(pack).filename().string() + "." + std::to_string(size) + "." + std::to_string(i))).string();
 }
 
-const std::vector<uint8_t>& Pack::stream(size_t i) {
-    Stream& s = streams_.at(i);
-    if (s.loaded) return s.data;
-    std::string cache = cachePath(path_, i);
-    if (FILE* cf = fopen(cache.c_str(), "rb")) {
-        s.data.resize(s.usize);
-        size_t n = s.usize ? fread(s.data.data(), 1, s.usize, cf) : 0;
-        fclose(cf);
-        if (n == s.usize) { s.loaded = true; return s.data; }
+namespace {
+#ifdef _WIN32
+struct Mapping {
+    HANDLE file = INVALID_HANDLE_VALUE, map = nullptr; const uint8_t* base = nullptr; uint64_t size = 0;
+    ~Mapping() { if (base) UnmapViewOfFile(base); if (map) CloseHandle(map); if (file != INVALID_HANDLE_VALUE) CloseHandle(file); }
+};
+std::shared_ptr<Mapping> mapFile(const std::string& path) {
+    auto m = std::make_shared<Mapping>();
+    m->file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    LARGE_INTEGER sz;
+    if (m->file == INVALID_HANDLE_VALUE || !GetFileSizeEx(m->file, &sz) || !sz.QuadPart) return nullptr;
+    m->size = (uint64_t)sz.QuadPart;
+    m->map = CreateFileMappingA(m->file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!m->map) return nullptr;
+    m->base = (const uint8_t*)MapViewOfFile(m->map, FILE_MAP_READ, 0, 0, 0);
+    return m->base ? m : nullptr;
+}
+#else
+struct Mapping {
+    const uint8_t* base = nullptr; uint64_t size = 0;
+    ~Mapping() { if (base) munmap((void*)base, size); }
+};
+std::shared_ptr<Mapping> mapFile(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return nullptr;
+    struct stat st;
+    auto m = std::make_shared<Mapping>();
+    if (fstat(fd, &st) == 0 && st.st_size) {
+        void* p = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (p != MAP_FAILED) { m->base = (const uint8_t*)p; m->size = st.st_size; }
     }
-    FILE* f = fopen(path_.c_str(), "rb");
-    if (!f) throw std::runtime_error("cannot open " + path_);
-    _fseeki64(f, s.offset, SEEK_SET);
-    s.data.resize(s.usize);
-    if (!s.csize) {
-        if (fread(s.data.data(), 1, s.usize, f) != s.usize) { fclose(f); throw std::runtime_error("short read"); }
-    } else {
-        z_stream z{}; inflateInit(&z);
-        std::vector<uint8_t> in(1 << 20);
-        uint32_t left = s.csize; z.next_out = s.data.data(); z.avail_out = s.usize;
-        int rc = Z_OK;
-        while (left && rc == Z_OK) {
-            size_t n = fread(in.data(), 1, left < in.size() ? left : in.size(), f);
+    close(fd);
+    return m->base ? m : nullptr;
+}
+#endif
+
+// inflates stream bytes [s.offset, s.offset+csize) of `src` straight into `dst` (no whole-stream buffer in RAM)
+bool inflateToFile(FILE* src, uint32_t offset, uint32_t csize, FILE* dst, uint32_t usize) {
+    _fseeki64(src, offset, SEEK_SET);
+    z_stream z{};
+    if (inflateInit(&z) != Z_OK) return false;
+    std::vector<uint8_t> in(1 << 20), out(1 << 22);
+    uint32_t left = csize;
+    uint64_t total = 0;
+    int rc = Z_OK;
+    while (rc == Z_OK) {
+        if (!z.avail_in) {
+            size_t n = left ? fread(in.data(), 1, std::min<size_t>(left, in.size()), src) : 0;
             if (!n) break;
             left -= (uint32_t)n; z.next_in = in.data(); z.avail_in = (uInt)n;
-            rc = inflate(&z, Z_NO_FLUSH);
         }
-        inflateEnd(&z);
-        if (rc != Z_STREAM_END) { fclose(f); throw std::runtime_error("inflate failed in " + path_); }
+        z.next_out = out.data(); z.avail_out = (uInt)out.size();
+        rc = inflate(&z, Z_NO_FLUSH);
+        size_t got = out.size() - z.avail_out;
+        if (got && fwrite(out.data(), 1, got, dst) != got) { inflateEnd(&z); return false; }
+        total += got;
     }
-    fclose(f);
-    s.loaded = true;
-    {
-        std::error_code ec;
+    inflateEnd(&z);
+    return rc == Z_STREAM_END && total == usize;
+}
+}  // namespace
+
+const uint8_t* Pack::stream(size_t i) {
+    Stream& s = streams_.at(i);
+    if (s.data) return s.data;
+    if (!s.csize) {
+        auto m = mapFile(path_);
+        if (!m || (uint64_t)s.offset + s.usize > m->size) throw std::runtime_error("cannot map " + path_);
+        s.data = m->base + s.offset; s.map = m;
+        return s.data;
+    }
+    std::string cache = cachePath(path_, i);
+    std::error_code ec;
+    if (!(std::filesystem::exists(cache, ec) && std::filesystem::file_size(cache, ec) == s.usize)) {
         std::filesystem::create_directories(std::filesystem::path(cache).parent_path(), ec);
         std::string tmp = cache + ".tmp";
-        if (FILE* cf = fopen(tmp.c_str(), "wb")) {
-            bool ok = fwrite(s.data.data(), 1, s.data.size(), cf) == s.data.size();
-            fclose(cf);
-            if (ok) std::filesystem::rename(tmp, cache, ec); else std::filesystem::remove(tmp, ec);
-        }
+        FILE* f = fopen(path_.c_str(), "rb");
+        FILE* cf = fopen(tmp.c_str(), "wb");
+        bool ok = f && cf && inflateToFile(f, s.offset, s.csize, cf, s.usize);
+        if (f) fclose(f);
+        if (cf) fclose(cf);
+        if (!ok) { std::filesystem::remove(tmp, ec); throw std::runtime_error("inflate failed in " + path_); }
+        std::filesystem::rename(tmp, cache, ec);
     }
+    auto m = mapFile(cache);
+    if (!m || m->size != s.usize) throw std::runtime_error("cannot map " + cache);
+    s.data = m->base; s.map = m;
     return s.data;
 }
 
 View Pack::chunkData(const Chunk& c) {
     size_t si = c.part & 0xff;
     if (si >= streams_.size()) return {};
-    const auto& d = stream(si);
-    if ((size_t)c.offset + c.size > d.size()) return {};
-    return {d.data() + c.offset, c.size};
+    const uint8_t* d = stream(si);
+    if ((size_t)c.offset + c.size > streams_[si].usize) return {};
+    return {d + c.offset, c.size};
 }
 
 View Pack::chunk(const Resource& r, uint8_t role) {
     for (const Chunk& c : r.chunks) {
         size_t si = c.part & 0xff;
         if (si < streams_.size() && (streams_[si].flags & 0xff) == role) {
-            const auto& d = stream(si);
-            if ((size_t)c.offset + c.size > d.size()) return {};
-            return {d.data() + c.offset, c.size};
+            const uint8_t* d = stream(si);
+            if ((size_t)c.offset + c.size > streams_[si].usize) return {};
+            return {d + c.offset, c.size};
         }
     }
     return {};

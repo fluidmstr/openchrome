@@ -1,6 +1,7 @@
 // RP6L container reader, see docs/formats/rpack.md
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -31,8 +32,9 @@ public:
     // data of one specific chunk of a resource
     View chunkData(const Chunk& c);
 private:
-    struct Stream { uint32_t flags, offset, usize, csize; std::vector<uint8_t> data; bool loaded = false; };
-    const std::vector<uint8_t>& stream(size_t i);
+    struct Stream { uint32_t flags, offset, usize, csize; const uint8_t* data = nullptr; std::shared_ptr<void> map; };
+    // memory-mapped stream bytes: the pack itself for raw streams, else the on-disk inflate cache (built by streaming inflate)
+    const uint8_t* stream(size_t i);
     std::string path_;
     std::vector<Stream> streams_;
     std::vector<Resource> res_;
