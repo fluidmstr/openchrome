@@ -19,8 +19,10 @@ class Pack:
         nrec, nstr, nres, strsz = h[3], h[4], h[5], h[6]
         p = 32
         self.streams = []
+        self.roles = []  # low byte of stream flags: 0x10/0x11/0x12 meta, 0xf0 vertices, 0xf1 indices, 0xff names
         for i in range(nstr):
             _, flags, off, usize, csize = struct.unpack_from('<5I', raw, p + 20 * i)
+            self.roles.append(flags & 0xff)
             # csize == 0: stored raw
             self.streams.append(zlib.decompress(raw[off:off + csize]) if csize else raw[off:off + usize])
         p += 20 * nstr
@@ -43,6 +45,9 @@ class Pack:
     def data(self, res):
         # bit 8 of the part id is set on some chunks (meaning unknown); stream index is the low byte
         return {s: self.streams[s & 0xff][o:o + n] for s, (o, n) in res.chunks.items()}
+
+    def by_role(self, res):
+        return {self.roles[s & 0xff]: v for s, v in self.data(res).items()}
 
 if __name__ == '__main__':
     pk = Pack(sys.argv[2])

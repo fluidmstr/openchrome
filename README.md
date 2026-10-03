@@ -9,7 +9,8 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6).
 - [x] `.rpack` container ([spec](docs/formats/rpack.md), `tools/rpack.py`)
 - [x] resource names, per-resource extraction
 - [x] textures -> DDS ([spec](docs/formats/texture.md), `tools/textures.py`)
-- [ ] meshes, materials
+- [x] static meshes -> OBJ ([spec](docs/formats/mesh.md), `tools/mesh.py`)
+- [ ] materials (.mat), skeletons/animations
 - [ ] map loading + free camera
 - [ ] gameplay
 
