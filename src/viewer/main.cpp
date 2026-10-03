@@ -907,6 +907,29 @@ int main(int argc, char** argv) {
         VK(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gg, nullptr, &glowPipeline));
     }
 
+    // sky: full-screen triangle drawn first, no depth
+    VkPipeline skyPipeline;
+    {
+        VkShaderModule kvs = loadShader(g, exeDir + "sky.vert.spv"), kfs = loadShader(g, exeDir + "sky.frag.spv");
+        VkPipelineShaderStageCreateInfo ks[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+        ks[0].stage = VK_SHADER_STAGE_VERTEX_BIT; ks[0].module = kvs; ks[0].pName = "main";
+        ks[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ks[1].module = kfs; ks[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo kvi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo kia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        kia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineDepthStencilStateCreateInfo kds = ds;
+        kds.depthTestEnable = VK_FALSE; kds.depthWriteEnable = VK_FALSE;
+        VkPipelineColorBlendAttachmentState kba{};
+        kba.colorWriteMask = 0xF;
+        VkPipelineColorBlendStateCreateInfo kcb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        kcb.attachmentCount = 1; kcb.pAttachments = &kba;
+        VkPipelineRasterizationStateCreateInfo krs = rs;
+        krs.cullMode = VK_CULL_MODE_NONE;
+        VkGraphicsPipelineCreateInfo kg = gpi;
+        kg.pStages = ks; kg.pVertexInputState = &kvi; kg.pInputAssemblyState = &kia; kg.pDepthStencilState = &kds; kg.pColorBlendState = &kcb; kg.pRasterizationState = &krs;
+        VK(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &kg, nullptr, &skyPipeline));
+    }
+
     // frame resources
     VkCommandBuffer cmds[FRAMES];
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -1176,6 +1199,9 @@ int main(int argc, char** argv) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &dset, 0, nullptr);
         uint32_t uboOff = 256u * (uint32_t)fi;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &dset1, 1, &uboOff);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyPipeline);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         for (const Draw& d : draws) {
             pc.tex = (uint32_t)world.mats[d.mat].slot;
             pc.nrmSpc = (uint32_t)world.mats[d.mat].nrmSlot | (uint32_t)world.mats[d.mat].spcSlot << 16;

@@ -26,7 +26,8 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6), wri
 | Vulkan viewer: shadows, tone mapping, time of day, streaming textures | done |
 | Skeletons, skin weights, static poses, CPU skinning | working, [spec](docs/formats/anim.md) |
 | Animation tracks (bit-packed ANM2 streams) | in progress |
-| Terrain layer blending, sky, vegetation, navmesh, gameplay | open |
+| Procedural sky (gradient, sun, night stars) | done (not the game's own sky) |
+| Terrain layer blending, vegetation, navmesh, gameplay | open |
 
 <img src="docs/img/characters.jpg" align="right" width="42%" alt="Textured character in bind pose and in a clip pose">
 

@@ -38,7 +38,7 @@ if((DEFINED ENV{VULKAN_SDK} OR EXISTS "C:/VulkanSDK") AND EXISTS "${CMAKE_SOURCE
   target_link_directories(oc_viewer PRIVATE "${VK_SDK}/Lib")
   target_link_libraries(oc_viewer oc_core vulkan-1 SDL2 SDL2main)
   find_program(GLSLC glslc HINTS "${VK_SDK}/Bin")
-  foreach(s mesh.vert mesh.frag shadow.vert glow.vert glow.frag)
+  foreach(s mesh.vert mesh.frag shadow.vert glow.vert glow.frag sky.vert sky.frag)
     add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/${s}.spv
       COMMAND ${GLSLC} ${CMAKE_SOURCE_DIR}/shaders/${s} -o ${CMAKE_BINARY_DIR}/${s}.spv
       DEPENDS ${CMAKE_SOURCE_DIR}/shaders/${s})
