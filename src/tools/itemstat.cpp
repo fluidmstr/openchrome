@@ -5,7 +5,10 @@
 #include <filesystem>
 #include <map>
 
+#include <set>
+
 #include "core/items.hpp"
+#include "core/rpack.hpp"
 #include "core/zip.hpp"
 
 namespace fs = std::filesystem;
@@ -48,6 +51,25 @@ int main(int argc, char** argv) {
         for (auto& i : all) if (i.base.empty()) plain[i.id]++;
         int derived = 0, resolved = 0, ownMesh = 0;
         for (auto& i : all) if (!i.base.empty()) { derived++; resolved += plain.count(i.base) ? 1 : 0; ownMesh += i.first("Mesh") ? 1 : 0; }
+        // mesh names (own or inherited from the base item) against the mesh resources of all packs
+        std::set<std::string> meshes;
+        for (auto& e : fs::directory_iterator(fs::path(argv[1]) / "Data")) {
+            if (e.path().extension() != ".rpack") continue;
+            try { oc::Pack pk(e.path().string()); for (auto& r : pk.resources()) if (r.flags == oc::TYPE_MESH) meshes.insert(r.name); } catch (std::exception&) {}
+        }
+        std::map<std::string, const oc::ItemDef*> byId;
+        for (auto& i : all) if (i.base.empty() && i.first("Mesh")) byId[i.id] = &i;
+        int withMesh = 0, found = 0;
+        for (auto& i : all) {
+            const oc::ScrValue* m = i.first("Mesh");
+            if (!m && !i.base.empty() && byId.count(i.base)) m = byId[i.base]->first("Mesh");
+            if (!m) continue;
+            withMesh++;
+            std::string n = m->text;
+            if (n.size() > 4 && n.compare(n.size() - 4, 4, ".msh") == 0) n.resize(n.size() - 4);
+            found += meshes.count(n) ? 1 : 0;
+        }
+        printf("items with a mesh (own or inherited) %d, found as mesh resource %d\n", withMesh, found);
         printf("derived items %d, base defined as a plain item %d, with own Mesh %d\n", derived, resolved, ownMesh);
         printf("%d items (%zu distinct ids, %d redefinitions)\n", total, seen.size(), dup);
         for (auto& c : cats) printf("  %-34s %d\n", c.first.c_str(), c.second);

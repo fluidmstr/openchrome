@@ -21,3 +21,7 @@ Flow and guards: `checkpoint` 952, `started quest guard` 372, `wait guard` 260, 
 ## Open
 
 Semantics of each phase type and its attributes, the guard/AND/OR evaluation rules, how `Phase` nesting expresses sequence versus parallel, how `QuestObject` names resolve to map entities, and how texts (`&Q_..._Name&` keys) map to the localisation tables.
+
+## Display names (verified)
+
+A quest `X` has the English title in `DataEn.pak` text tables under key `X_Name` (203 of 1137 quests have one directly); the text may itself be a `&Other_Name&` reference to another entry, resolved by repeating the lookup with `Other`. Quests chained by `parent` (`University01`, `University02`, ...) share their title, so a numbered chain is the stages of one story quest. `oc_queststat <DW dir> <level>` prints the titles.

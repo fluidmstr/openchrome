@@ -18,4 +18,6 @@ Most common properties: `ItemType`, `Mesh`, `Color`, `GameVersion`, `Condition`,
 
 Derived items: of the 3679, 3570 name a base that is defined as a plain item (the other 109 point at ids defined only through other derived items or elsewhere); none of them sets its own `Mesh`, so the mesh is inherited from the base.
 
+Link to meshes (checked by `oc_itemstat`): 6234 items have a mesh (own or inherited), 6134 of them name a `.msh` that exists as a mesh resource in `Data/*.rpack` (name without the `.msh` suffix).
+
 Open: the exact inheritance and override order of derived items, meaning of `Condition`/`UpgradeLevel` chains, and how `Name` / `Description` text keys map to localisation tables.
