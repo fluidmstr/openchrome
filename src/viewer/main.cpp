@@ -29,6 +29,7 @@
 #include "core/rpack.hpp"
 #include "core/sobj.hpp"
 #include "core/zip.hpp"
+#include "viewer/collide.hpp"
 
 namespace fs = std::filesystem;
 
@@ -604,11 +605,13 @@ int main(int argc, char** argv) {
     fs::path dw = argv[1];
     World world;
     std::string map = "old_town", shot;
+    bool startWalk = false;
     glm::vec3 camPos(300, 70, 100);
     float yaw = 0.0f, pitch = -0.25f, radius = 450.0f, hour = 15.0f;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--shot" && i + 1 < argc) shot = argv[++i];
+        else if (a == "--walk") startWalk = true;
         else if (a == "--radius" && i + 1 < argc) radius = (float)atof(argv[++i]);
         else if (a == "--spawn" && i + 6 < argc) { world.spawns.push_back({argv[i + 1], argv[i + 2], {(float)atof(argv[i + 3]), (float)atof(argv[i + 4]), (float)atof(argv[i + 5])}, (float)atof(argv[i + 6])}); i += 6; }
         else if (a == "--item" && i + 5 < argc) { world.itemSpawns.push_back({argv[i + 1], {(float)atof(argv[i + 2]), (float)atof(argv[i + 3]), (float)atof(argv[i + 4])}, (float)atof(argv[i + 5])}); i += 5; }
@@ -983,6 +986,27 @@ int main(int argc, char** argv) {
     bool running = true, resized = false;
     double acc = 0; int accN = 0;
 
+    bool walk = false, onGround = false;
+    float vy = 0.0f;
+    std::unique_ptr<Collider> collider;
+    auto ensureCollider = [&]() {
+        if (collider) return;
+        ColliderInput ci{&world.vertices, &world.indices, &world.objects.instances, {}, {}, {}};
+        for (size_t ty = 0; ty < world.geom.size(); ty++) {
+            const TypeGeom& tg = world.geom[ty];
+            ci.ranges.emplace_back();
+            for (const Sub& sb : tg.subs[0]) ci.ranges.back().push_back({sb.first, sb.count});
+            ci.vertexOffset.push_back(tg.vertexOffset[0]);
+            std::string l = world.objects.types[ty].mesh;
+            for (auto& c : l) c = (char)tolower((unsigned char)c);
+            static const char* nosolid[] = {"grass", "leaf", "leaves", "bush", "plant", "foliage", "wire", "cable", "cloth", "flag", "rope", "light", "lamp_", "glass", "horizon", "sign"};
+            bool solid = tg.valid && !skipType(l);
+            for (auto s : nosolid) if (l.find(s) != std::string::npos) solid = false;
+            ci.solid.push_back(solid);
+        }
+        collider = std::make_unique<Collider>(std::move(ci));
+    };
+    if (startWalk) { walk = true; ensureCollider(); }
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -991,24 +1015,73 @@ int main(int argc, char** argv) {
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_RIGHTBRACKET) hour = std::fmod(hour + 0.5f, 24.0f);
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_LEFTBRACKET) hour = std::fmod(hour + 23.5f, 24.0f);
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_p) printf("--cam %.2f %.2f %.2f %.3f %.3f\n", camPos.x, camPos.y, camPos.z, yaw, pitch), fflush(stdout);
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_g) {
+                walk = !walk;
+                vy = 0.0f;
+                if (walk) ensureCollider();
+            }
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_n) hour = (hour > 7.0f && hour < 18.0f) ? 22.0f : 14.0f;
             else if (e.type == SDL_MOUSEMOTION && SDL_GetRelativeMouseMode()) { yaw += e.motion.xrel * 0.0025f; pitch = std::clamp(pitch - e.motion.yrel * 0.0025f, -1.55f, 1.55f); }
             else if (e.type == SDL_MOUSEWHEEL) speed = std::clamp(speed * (e.wheel.y > 0 ? 1.25f : 0.8f), 2.0f, 2000.0f);
             else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) resized = true;
         }
         uint64_t now = SDL_GetPerformanceCounter();
-        float dt = (float)((double)(now - last) / (double)SDL_GetPerformanceFrequency());
+        float dt = shot.empty() ? (float)((double)(now - last) / (double)SDL_GetPerformanceFrequency()) : 1.0f / 60.0f;
         last = now;
         glm::vec3 fwd(std::cos(pitch) * std::cos(yaw), std::sin(pitch), std::cos(pitch) * std::sin(yaw));
         glm::vec3 right = glm::normalize(glm::cross(fwd, glm::vec3(0, 1, 0)));
         const Uint8* k = SDL_GetKeyboardState(nullptr);
         float sp = speed * (k[SDL_SCANCODE_LSHIFT] ? 5.0f : 1.0f) * (k[SDL_SCANCODE_LCTRL] ? 0.2f : 1.0f);
-        if (k[SDL_SCANCODE_W]) camPos += fwd * sp * dt;
-        if (k[SDL_SCANCODE_S]) camPos -= fwd * sp * dt;
-        if (k[SDL_SCANCODE_D]) camPos += right * sp * dt;
-        if (k[SDL_SCANCODE_A]) camPos -= right * sp * dt;
-        if (k[SDL_SCANCODE_E]) camPos.y += sp * dt;
-        if (k[SDL_SCANCODE_Q]) camPos.y -= sp * dt;
+        if (walk && collider) {
+            // 1.7 m eye, 0.35 m radius, 0.6 m steps; feet = eye - 1.7
+            const float eye = 1.7f, rad = 0.35f, step = 0.6f;
+            glm::vec3 fl = glm::normalize(glm::vec3(fwd.x, 0, fwd.z)), rl = glm::vec3(-fl.z, 0, fl.x);
+            glm::vec3 wish = fl * (float)(k[SDL_SCANCODE_W] - k[SDL_SCANCODE_S]) + rl * (float)(k[SDL_SCANCODE_D] - k[SDL_SCANCODE_A]);
+            glm::vec3 feet(camPos.x, camPos.y - eye, camPos.z);
+            if (glm::dot(wish, wish) > 0.0f) {
+                float len = (k[SDL_SCANCODE_LSHIFT] ? 9.0f : 4.5f) * dt;
+                glm::vec3 dir = glm::normalize(wish), mv = dir * len;
+                for (int pass = 0; pass < 2 && len > 1e-5f; pass++) {
+                    float tHit = len + rad;
+                    glm::vec3 nHit(0), n;
+                    bool blocked = false;
+                    for (float h : {step + 0.05f, 1.1f, 1.6f}) {
+                        float t;
+                        if (collider->ray(feet + glm::vec3(0, h, 0), dir, len + rad, t, n) && fabsf(n.y) < 0.7f && t < tHit) { tHit = t; nHit = n; blocked = true; }
+                    }
+                    if (!blocked) { feet += dir * len; break; }
+                    feet += dir * std::max(tHit - rad, 0.0f);
+                    // slide along the wall for the remaining distance
+                    float rest = len - std::max(tHit - rad, 0.0f);
+                    glm::vec3 slide = dir - nHit * glm::dot(dir, nHit);
+                    slide.y = 0;
+                    if (glm::dot(slide, slide) < 1e-6f) break;
+                    dir = glm::normalize(slide);
+                    len = rest * 0.7f;
+                }
+            }
+            if (k[SDL_SCANCODE_SPACE] && onGround) { vy = 5.5f; onGround = false; }
+            vy -= 18.0f * dt;
+            float fall = -vy * dt, rise = vy * dt;
+            float t; glm::vec3 n;
+            if (vy <= 0.0f && collider->ray(feet + glm::vec3(0, step, 0), glm::vec3(0, -1, 0), step + fall + 0.05f, t, n)) {
+                feet.y = feet.y + step - t;
+                vy = 0.0f;
+                onGround = true;
+            } else {
+                feet.y += rise;
+                onGround = false;
+                if (vy > 0.0f && collider->ray(feet + glm::vec3(0, eye, 0), glm::vec3(0, 1, 0), 0.3f, t, n)) vy = 0.0f;
+            }
+            camPos = feet + glm::vec3(0, eye, 0);
+        } else {
+            if (k[SDL_SCANCODE_W]) camPos += fwd * sp * dt;
+            if (k[SDL_SCANCODE_S]) camPos -= fwd * sp * dt;
+            if (k[SDL_SCANCODE_D]) camPos += right * sp * dt;
+            if (k[SDL_SCANCODE_A]) camPos -= right * sp * dt;
+            if (k[SDL_SCANCODE_E]) camPos.y += sp * dt;
+            if (k[SDL_SCANCODE_Q]) camPos.y -= sp * dt;
+        }
 
         {
             int dw_, dh_;
@@ -1239,7 +1312,7 @@ int main(int argc, char** argv) {
             vkCmdDraw(cmd, (uint32_t)numLights, 1, 0, 0);
         }
         vkCmdEndRendering(cmd);
-        bool takeShot = !shot.empty() && frame == 8;
+        bool takeShot = !shot.empty() && frame == (startWalk ? 300 : 8);
         if (takeShot) {
             imageBarrier(cmd, g.images[imgIdx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -1276,6 +1349,7 @@ int main(int argc, char** argv) {
                 }
                 f.write(row.data(), row.size());
             }
+            if (startWalk) printf("--cam %.2f %.2f %.2f %.3f %.3f\n", camPos.x, camPos.y, camPos.z, yaw, pitch);
             printf("screenshot %s: %zu instances, %zu draws\n", shot.c_str(), vis.size(), draws.size());
             running = false;
         }
