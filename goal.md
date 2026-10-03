@@ -23,6 +23,11 @@ A playable Dying Light 1, started like the stock executable: point `openchrome` 
 9. **UI**: Scaleform/GFx or the engine's own format for menus and HUD, input remapping, settings.
 10. **Polish**: performance, shipping a `--game-dir` launcher, compatibility with game versions and mods.
 
+## Findings that shape the plan
+
+- **Scripts are text.** `Data*.pak` holds about 3900 `.scr` files (28 MB), plain C-like text (`sub main() { ... }`); ~100 are UTF-16 editor files or binary. They are mostly declarative: calls such as `Event`, `Phase`, `Quest`, `Item`, `SpawnPoint`, `SeqTrack`, `Chatter`, `Sound` describe data, and control flow is rare (only ~70 `if`, ~250 `for`). A parser that builds a call tree plus a small interpreter for `sub`/`include`/`import`/`class` is enough to start; no binary reverse engineering needed.
+- **Animation tracks** (`docs/formats/anim.md`): only static poses are decoded; the bit-packed stream is the open problem of milestone 3.
+
 ## Rules
 
 - Clean room: formats come from the user's own files, documented in `docs/formats/`, with verified and guessed parts marked.
