@@ -23,6 +23,14 @@ A playable Dying Light 1, started like the stock executable: point `openchrome` 
 9. **UI**: Scaleform/GFx or the engine's own format for menus and HUD, input remapping, settings.
 10. **Polish**: performance, shipping a `--game-dir` launcher, compatibility with game versions and mods.
 
+## Secondary goals: other platforms
+
+Not before the PC game works; they only shape the code (no Windows-only calls outside thin wrappers, no desktop-only assumptions in the core).
+
+- **Linux and macOS**: native builds from the same CMake project. Linux uses Vulkan directly; macOS goes through MoltenVK. Needs portable file access (`_fseeki64`, memory mapping already has a POSIX path) and case-sensitive paths.
+- **Android**: APK with SDL2, Vulkan; the game data stays outside the APK (user copy). Needs a fallback for GPUs without BC textures (decode or transcode), no dependence on Vulkan 1.3-only features, and streaming of data instead of holding it in RAM (rpack is already memory-mapped).
+- **PSP (joke build)**: a deliberately crude, viewer-only experiment, not a port and not a promise: a few static meshes with vertex colours or tiny textures, a fly camera, no game logic. Success is "it shows a bit of Old Town on real or emulated hardware".
+
 ## Findings that shape the plan
 
 - **Scripts are text.** `Data*.pak` holds about 3900 `.scr` files (28 MB), plain C-like text (`sub main() { ... }`); ~100 are UTF-16 editor files or binary. They are mostly declarative: calls such as `Event`, `Phase`, `Quest`, `Item`, `SpawnPoint`, `SeqTrack`, `Chatter`, `Sound` describe data, and control flow is rare (only ~70 `if`, ~250 `for`). A parser that builds a call tree plus a small interpreter for `sub`/`include`/`import`/`class` is enough to start; no binary reverse engineering needed.
