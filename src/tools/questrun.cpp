@@ -4,10 +4,13 @@
 #include <filesystem>
 #include <map>
 
+#include "core/exp.hpp"
 #include "core/questrun.hpp"
 #include "core/zip.hpp"
 
 namespace fs = std::filesystem;
+
+static std::map<std::string, oc::Entity> g_ents;  // by name; the entities of the quest's map
 
 static std::string describe(const oc::QuestPhase& p) {
     std::string s = "[" + p.type + "]";
@@ -15,7 +18,12 @@ static std::string describe(const oc::QuestPhase& p) {
     for (auto& a : p.attr) s += " " + a.first + "=" + a.second;
     for (auto& o : p.objects)
         for (auto& q : o.kids)
-            if (q.tag == "QuestObject") s += " <" + q.get("class") + " " + q.get("name") + ">";
+            if (q.tag == "QuestObject") {
+                s += " <" + q.get("class") + " " + q.get("name");
+                auto it = g_ents.find(q.get("name"));
+                if (it != g_ents.end() && it->second.hasTransform) { char b[64]; snprintf(b, sizeof b, " @%.0f,%.0f,%.0f", it->second.m[3], it->second.m[7], it->second.m[11]); s += b; }
+                s += ">";
+            }
     return s;
 }
 
@@ -32,6 +40,13 @@ int main(int argc, char** argv) {
             oc::QuestFile qf;
             if (oc::readZipEntry(p, name, b) && oc::loadQuests(std::string(b.begin(), b.end()), qf)) mgr.add(qf);
         }
+    }
+    {
+        std::vector<uint8_t> exp;
+        std::string level = mgr.levelOf(argv[2]);
+        if (oc::readZipEntry((fs::path(argv[1]) / "Data2.pak").string(), "data/maps/" + level + "/" + level + ".exp", exp))
+            for (auto& e : oc::parseEntities(exp)) if (!e.name.empty()) g_ents.emplace(e.name, e);
+        printf("level %s, %zu named entities\n", level.c_str(), g_ents.size());
     }
     float now = 0;
     std::map<const oc::QuestPhase*, float> seen;

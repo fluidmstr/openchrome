@@ -1,6 +1,7 @@
 // Map entity database (.exp): LightObject records, see docs/formats/exp.md
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace oc {
@@ -15,5 +16,15 @@ struct Light {
 
 // Scans the blob for LightObject records. Never throws; malformed records are skipped.
 std::vector<Light> parseLights(const std::vector<uint8_t>& data);
+
+// Any placed entity: class-tagged record with a name (property 0x16) and a 3x4 row-major transform (property 0xdf, translation in column 3).
+struct Entity {
+    std::string cls, name;
+    float m[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    bool hasTransform = false;
+};
+
+// Scans for `[u16 len]Class=` record markers; records without a name keep an empty name. Never throws.
+std::vector<Entity> parseEntities(const std::vector<uint8_t>& data);
 
 }  // namespace oc

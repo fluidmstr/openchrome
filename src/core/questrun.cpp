@@ -61,7 +61,7 @@ static bool step(const Quest& q, QuestHost& host, QuestExec& e, float dt) {
 }
 
 void QuestManager::add(const QuestFile& f) {
-    for (const Quest& q : f.quests) quests_.emplace(q.name, q);
+    for (const Quest& q : f.quests) { quests_.emplace(q.name, q); levels_.emplace(q.name, f.level); }
 }
 
 const Quest* QuestManager::find(const std::string& name) const {

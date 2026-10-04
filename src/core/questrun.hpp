@@ -46,6 +46,7 @@ class QuestManager : public QuestHost {
 public:
     void add(const QuestFile& f);
     const Quest* find(const std::string& name) const;
+    const std::string& levelOf(const std::string& quest) const { static const std::string none; auto i = levels_.find(quest); return i == levels_.end() ? none : i->second; }
     bool start(const std::string& name);
     bool started(const std::string& name) const { return runners_.count(name) > 0; }
     bool finished(const std::string& name) const { return done_.count(name) > 0; }
@@ -62,6 +63,7 @@ public:
 
 private:
     std::map<std::string, Quest> quests_;
+    std::map<std::string, std::string> levels_;  // quest -> map it is defined for
     std::map<std::string, std::unique_ptr<QuestRunner>> runners_;
     std::set<std::string> done_;
     std::map<const QuestPhase*, float> timers_;

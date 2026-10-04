@@ -49,4 +49,39 @@ std::vector<Light> parseLights(const std::vector<uint8_t>& d) {
     return out;
 }
 
+std::vector<Entity> parseEntities(const std::vector<uint8_t>& d) {
+    // markers: u16 length, identifier (starts upper case), '=', 0
+    std::vector<std::pair<size_t, std::string>> marks;
+    for (size_t i = 0; i + 4 < d.size(); i++) {
+        uint16_t len = rd<uint16_t>(&d[i]);
+        if (len < 4 || len > 48 || i + 2 + len + 2 > d.size() || d[i + 2] < 'A' || d[i + 2] > 'Z' || d[i + 2 + len] != '=' || d[i + 3 + len] != 0) continue;
+        bool ok = true;
+        for (size_t k = 0; k < len && ok; k++) ok = isalnum(d[i + 2 + k]) || d[i + 2 + k] == '_';
+        if (!ok) continue;
+        marks.push_back({i, std::string(reinterpret_cast<const char*>(&d[i + 2]), len)});
+        i += len + 2;
+    }
+    std::vector<Entity> out;
+    for (size_t k = 0; k < marks.size(); k++) {
+        size_t b = marks[k].first, e = k + 1 < marks.size() ? marks[k + 1].first : d.size();
+        Entity en;
+        en.cls = marks[k].second;
+        // properties: [u16 id][u32 size][data]; 0xdf = transform (48 bytes), 0x16 = name (u16 length + chars)
+        static const uint8_t tr[6] = {0xdf, 0x00, 0x30, 0x00, 0x00, 0x00};
+        for (size_t i = b; i + 54 <= e; i++) {
+            if (std::memcmp(&d[i], tr, 6) == 0) { std::memcpy(en.m, &d[i + 6], 48); en.hasTransform = true; break; }
+        }
+        for (size_t i = b; i + 8 <= e; i++) {
+            if (d[i] != 0x16 || d[i + 1] != 0 || rd<uint32_t>(&d[i + 2]) < 3) continue;
+            uint32_t size = rd<uint32_t>(&d[i + 2]);
+            uint16_t len = rd<uint16_t>(&d[i + 6]);
+            if (size != len + 2u || i + 8 + len > e) continue;
+            en.name.assign(reinterpret_cast<const char*>(&d[i + 8]), len);
+            break;
+        }
+        out.push_back(std::move(en));
+    }
+    return out;
+}
+
 }  // namespace oc

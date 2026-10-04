@@ -19,6 +19,10 @@ Open: meaning of the `kind` words (point / spot / area variants), cones, falloff
 Light radius = clamp(max(scale) * 0.55, 3, 40) m, colour * intensity, binned into a 16 m grid (<= 48 lights/cell).
 Lamps and window plugs (`emissive` surfaces) turn on at night; the real per-lamp on/off state is not decoded.
 
+## Entity records (verified on slums_interior)
+
+Every entity starts with `[u16 len]Class=[00]`; properties follow as `[u16 id][u32 size][data]`. Id `0x16` is the entity name (`u16 len` + chars, size = len + 2), id `0xdf` (size 48) is a 3x4 row-major transform with the translation in `m[3], m[7], m[11]`. `parseEntities` returns class, name and transform; 1248 of 3493 records of the map carry a name. These names are what `QuestObject name=` refers to (`oc_questrun` prints the position of every quest object: `cin_the_tower_waking_up_spawn` is at 256, 234, 51 in slums_interior).
+
 ## Other classes seen (not decoded)
 
 `ModelObject`, `SpawnPoint`, `Encounter`, ...
