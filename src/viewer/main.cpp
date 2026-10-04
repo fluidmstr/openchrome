@@ -1033,6 +1033,8 @@ int main(int argc, char** argv) {
     oc::QuestManager quests;
     std::map<std::string, glm::vec3> entPos;
     std::map<const oc::QuestPhase*, float> waitT;
+    std::string objective;  // shown in the window title
+    glm::vec3 objPos(0);
     if (!questName.empty()) {
         std::vector<uint8_t> exp;
         if (oc::readZipEntry((dw / "Data2.pak").string(), "data/maps/" + map + "/" + map + ".exp", exp))
@@ -1049,12 +1051,13 @@ int main(int argc, char** argv) {
                     if (qo.tag != "QuestObject" || it == entPos.end() || (p.type != "go to" && p.type != "checkpoint")) continue;
                     float dist = p.attr.count("distance") ? (float)atof(p.attr.at("distance").c_str()) : 3.0f;
                     if (glm::distance(it->second, camPos - glm::vec3(0, 1.7f, 0)) <= std::max(dist, 1.0f)) return true;
-                    if (!waitT.count(&p)) { waitT[&p] = 0; printf("quest %s: go to %s %s at %.0f %.0f %.0f\n", q.name.c_str(), p.name.c_str(), qo.get("name").c_str(), it->second.x, it->second.y, it->second.z); }
+                    if (!waitT.count(&p)) { waitT[&p] = 0; if (p.type == "checkpoint") { camPos = it->second + glm::vec3(0, 1.7f, 0); vy = 0; } if (p.type == "go to" && p.name != "_") objective = p.name; printf("quest %s: go to %s %s at %.0f %.0f %.0f\n", q.name.c_str(), p.name.c_str(), qo.get("name").c_str(), it->second.x, it->second.y, it->second.z); }
+                    objPos = it->second;
                     return false;
                 }
             float& t = waitT[&p];
             if (t == 0) printf("quest %s: wait %s %s\n", q.name.c_str(), p.type.c_str(), p.name.c_str());
-            return (t += dt) >= 1.0f;
+            return (t += dt) >= 0.3f;
         };
         if (!quests.start(questName)) fprintf(stderr, "no quest %s\n", questName.c_str());
     }
@@ -1409,7 +1412,7 @@ int main(int argc, char** argv) {
         acc += dt; accN++;
         if (accN == 120 && shot.empty()) {
             char title[160];
-            snprintf(title, sizeof title, "openchrome  %.1f fps  %zu instances  %zu draws", accN / acc, vis.size(), draws.size());
+            snprintf(title, sizeof title, "openchrome  %.1f fps  %zu instances  %zu draws  %s %.0f m", accN / acc, vis.size(), draws.size(), objective.c_str(), glm::distance(objPos, camPos));
             SDL_SetWindowTitle(g.window, title);
             acc = 0; accN = 0;
         }
