@@ -11,6 +11,12 @@ Independent, from-scratch runtime for **Dying Light (1)** (Chrome Engine 6), wri
 <img src="docs/img/night.jpg" width="49%" alt="Old Town at night with lamps and lit windows">
 </p>
 
+<p>
+<img src="docs/img/foliage_cliffs.jpg" width="32%" alt="Alpha-tested foliage and blended terrain">
+<img src="docs/img/slums_overview.jpg" width="32%" alt="The Slums">
+<img src="docs/img/walk_rooftop.jpg" width="32%" alt="Walk mode on a rooftop">
+</p>
+
 *Screenshots are rendered by `oc_viewer` straight from the game files (Old Town map): materials and textures from the material database, sun and moon lighting, shadow map, point lights and lit windows at night.*
 
 ## What works
