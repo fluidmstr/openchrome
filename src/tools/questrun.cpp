@@ -1,0 +1,53 @@
+// `oc_questrun <DW dir> <quest> [seconds]`: runs one quest (and, as they become startable, the quests chained to it) on simulated time
+// and prints what its phases do. Waiting phases (go to, talk, use, ...) are satisfied 0.5 s after they start.
+#include <cstdio>
+#include <filesystem>
+#include <map>
+
+#include "core/questrun.hpp"
+#include "core/zip.hpp"
+
+namespace fs = std::filesystem;
+
+static std::string describe(const oc::QuestPhase& p) {
+    std::string s = "[" + p.type + "]";
+    if (!p.name.empty() && p.name != "_") s += " " + p.name;
+    for (auto& a : p.attr) s += " " + a.first + "=" + a.second;
+    for (auto& o : p.objects)
+        for (auto& q : o.kids)
+            if (q.tag == "QuestObject") s += " <" + q.get("class") + " " + q.get("name") + ">";
+    return s;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) { fprintf(stderr, "usage: oc_questrun <DW dir> <quest> [seconds]\n"); return 1; }
+    float limit = argc > 3 ? (float)atof(argv[3]) : 600.0f;
+    oc::QuestManager mgr;
+    for (auto& e : fs::directory_iterator(argv[1])) {
+        std::string p = e.path().string();
+        if (e.path().extension() != ".pak" || e.path().filename().string().rfind("Data", 0) != 0) continue;
+        for (auto& name : oc::listZip(p)) {
+            if (name.rfind("data/quests/", 0) != 0 || name.size() < 4 || name.substr(name.size() - 4) != ".xml" || name.find("_underlay") != std::string::npos) continue;
+            std::vector<uint8_t> b;
+            oc::QuestFile qf;
+            if (oc::readZipEntry(p, name, b) && oc::loadQuests(std::string(b.begin(), b.end()), qf)) mgr.add(qf);
+        }
+    }
+    float now = 0;
+    std::map<const oc::QuestPhase*, float> seen;
+    mgr.onRun = [&](const oc::Quest& q, const oc::QuestPhase& p) { printf("%7.2f %s: %s\n", now, q.name.c_str(), describe(p).c_str()); };
+    mgr.onWait = [&](const oc::Quest& q, const oc::QuestPhase& p, float dt) {
+        auto it = seen.find(&p);
+        if (it == seen.end()) { seen[&p] = now; printf("%7.2f %s: wait %s\n", now, q.name.c_str(), describe(p).c_str()); return false; }
+        return now - it->second >= 0.5f;
+    };
+    if (!mgr.start(argv[2])) { fprintf(stderr, "no quest %s\n", argv[2]); return 1; }
+    size_t doneBefore = 0;
+    for (; now < limit && mgr.active(); now += 0.25f) {
+        mgr.update(0.25f);
+        for (auto* q : mgr.startable()) if (mgr.finished(q->parent) ) (void)q;
+        (void)doneBefore;
+    }
+    printf("finished: %s; active quests %zu after %.1f s\n", mgr.finished(argv[2]) ? "yes" : "no", mgr.active(), now);
+    return 0;
+}

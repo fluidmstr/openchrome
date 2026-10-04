@@ -18,6 +18,14 @@ Quest name parent [glued reward_set difficulty quest_giver leading_portal new_ch
 
 Flow and guards: `checkpoint` 952, `started quest guard` 372, `wait guard` 260, `gather players guard` 162, `AND` 618, `OR` 141, `semaphore` 19. Actions: `enable` 961, `appear` 698, `go to` 446, `use` 213, `talk` 179, `use life place` 136, `set state` 123, `kill` 69, `set dialog` 64, `set reward` 63, `set skin` 53, `movie` 44, `take item` 26, `take challenge` 22, `player control` 19, plus ~25 rarer ones (`set weather`, `set day night time`, `force encounter`, `loot container`, `clear area`, ...).
 
+## Phase tree and execution (loader + `oc_questrun`)
+
+Structure (verified over all 305 files): a `Quest` is a sequence of phases. `AND` and `OR` phases (1148 + 427 of the ~15300 phases, counting nested ones) contain one or more `<Path>` elements, each a sequence of phases; every other phase carries `Destination` / `Trigger` / `Spawner` / `Object` / `SpecificLocation` children instead. `DebugPlayerPosition` children are editor teleports.
+
+Execution model (guessed, produces sensible traces): phases of a sequence run in order; an AND phase runs its paths in parallel and ends when all paths ended, OR ends when one did (the others are dropped); a phase without paths ends at once. Instant phases act (enable, appear, set weather, hudgroup, player control, set dialog, ...); waiting phases (`go to`, `checkpoint`, `use`, `talk`, `kill`, `use life place`, `movie`, `take item`, `loot container`, `clear area`, every `* guard`) block until the game reports them done. `wait guard` waits `time` seconds, `started quest guard quest_name=X finished=true` waits for quest X to finish. A quest is startable once its `parent` has finished (`game_root` always).
+
+`src/core/questrun.{hpp,cpp}` (`QuestRunner`, `QuestManager`, host callbacks `onRun` / `onWait`) and `oc_questrun <DW dir> <quest> [seconds]` implement this on simulated time. Check: `Prologue` starts by hiding the HUD groups and the watch/flashlight, freezing time at 9:50, populating the Tower with NPC life places, then waits for the wake-up movie trigger, shows the `Tutorial_PrologueMove` hint and sends the player to the exit doors, i.e. the order of the real game intro.
+
 ## Open
 
 Semantics of each phase type and its attributes, the guard/AND/OR evaluation rules, how `Phase` nesting expresses sequence versus parallel, how `QuestObject` names resolve to map entities, and how texts (`&Q_..._Name&` keys) map to the localisation tables.

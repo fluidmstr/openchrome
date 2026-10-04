@@ -21,6 +21,7 @@ struct QuestPhase {
     std::string type, name;
     std::map<std::string, std::string> attr;   // everything else (distance, mode, state, speaker, ...)
     std::vector<XmlNode> objects;              // Destination, Trigger, Spawner, ... children
+    std::vector<std::vector<QuestPhase>> paths;  // AND / OR phases: each <Path> is a sequence of phases
 };
 
 struct Quest {

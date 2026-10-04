@@ -87,6 +87,21 @@ bool parseXml(const std::string& text, XmlNode& root) {
     return false;
 }
 
+static QuestPhase convertPhase(const XmlNode& p) {
+    QuestPhase ph;
+    ph.type = p.get("type");
+    ph.name = p.get("name");
+    ph.attr = p.attr;
+    for (const char* k : {"type", "name", "pxsl_line"}) ph.attr.erase(k);
+    for (auto& c : p.kids) {
+        if (c.tag != "Path") { ph.objects.push_back(c); continue; }
+        ph.paths.emplace_back();
+        for (auto& s : c.kids)
+            if (s.tag == "Phase") ph.paths.back().push_back(convertPhase(s));
+    }
+    return ph;
+}
+
 bool loadQuests(const std::string& xmlText, QuestFile& out) {
     XmlNode root;
     if (!parseXml(xmlText, root) || root.tag != "QuestsDefinitions") return false;
@@ -98,16 +113,8 @@ bool loadQuests(const std::string& xmlText, QuestFile& out) {
         quest.parent = q.get("parent");
         quest.attr = q.attr;
         for (const char* k : {"name", "parent", "pxsl_line"}) quest.attr.erase(k);
-        for (auto& p : q.kids) {
-            if (p.tag != "Phase") continue;
-            QuestPhase ph;
-            ph.type = p.get("type");
-            ph.name = p.get("name");
-            ph.attr = p.attr;
-            for (const char* k : {"type", "name", "pxsl_line"}) ph.attr.erase(k);
-            ph.objects = p.kids;
-            quest.phases.push_back(std::move(ph));
-        }
+        for (auto& p : q.kids)
+            if (p.tag == "Phase") quest.phases.push_back(convertPhase(p));
         out.quests.push_back(std::move(quest));
     }
     return true;
