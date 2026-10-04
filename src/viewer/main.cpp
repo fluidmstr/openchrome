@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "core/exp.hpp"
+#include "core/questrun.hpp"
 #include "core/fsb.hpp"
 #include "core/items.hpp"
 #include "core/mesh.hpp"
@@ -605,7 +606,7 @@ int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: oc_viewer <DW dir> [map] [--shot out.ppm] [--cam x y z yaw pitch] [--radius R]\n"); return 1; }
     fs::path dw = argv[1];
     World world;
-    std::string map = "old_town", shot, music;
+    std::string map = "old_town", shot, music, questName;
     bool startWalk = false;
     glm::vec3 camPos(300, 70, 100);
     float yaw = 0.0f, pitch = -0.25f, radius = 450.0f, hour = 15.0f;
@@ -617,6 +618,7 @@ int main(int argc, char** argv) {
         else if (a == "--spawn" && i + 6 < argc) { world.spawns.push_back({argv[i + 1], argv[i + 2], {(float)atof(argv[i + 3]), (float)atof(argv[i + 4]), (float)atof(argv[i + 5])}, (float)atof(argv[i + 6])}); i += 6; }
         else if (a == "--item" && i + 5 < argc) { world.itemSpawns.push_back({argv[i + 1], {(float)atof(argv[i + 2]), (float)atof(argv[i + 3]), (float)atof(argv[i + 4])}, (float)atof(argv[i + 5])}); i += 5; }
         else if (a == "--nomap") world.nomap = true;
+        else if (a == "--quest" && i + 1 < argc) questName = argv[++i];
         else if (a == "--music" && i + 1 < argc) music = argv[++i];
         else if (a == "--parts" && i + 1 < argc && !world.spawns.empty()) {
             // list of part[=material.mat]
@@ -1026,6 +1028,36 @@ int main(int argc, char** argv) {
         collider = std::make_unique<Collider>(std::move(ci));
     };
     if (startWalk) { walk = true; ensureCollider(); }
+
+    // --quest <name>: runs a quest of the map; time-of-day phases apply, go to / checkpoint wait for the player to come close, other waits pass after 1 s
+    oc::QuestManager quests;
+    std::map<std::string, glm::vec3> entPos;
+    std::map<const oc::QuestPhase*, float> waitT;
+    if (!questName.empty()) {
+        std::vector<uint8_t> exp;
+        if (oc::readZipEntry((dw / "Data2.pak").string(), "data/maps/" + map + "/" + map + ".exp", exp))
+            for (auto& en : oc::parseEntities(exp)) if (en.hasTransform && !en.name.empty()) entPos.emplace(en.name, glm::vec3(en.m[3], en.m[7], en.m[11]));
+        quests.loadAll(dw.string());
+        quests.onRun = [&](const oc::Quest& q, const oc::QuestPhase& p) {
+            if (p.type == "set day night time" && p.attr.count("day_time")) hour = (float)atof(p.attr.at("day_time").c_str());
+            else printf("quest %s: %s %s\n", q.name.c_str(), p.type.c_str(), p.name.c_str());
+        };
+        quests.onWait = [&](const oc::Quest& q, const oc::QuestPhase& p, float dt) {
+            for (auto& o : p.objects)
+                for (auto& qo : o.kids) {
+                    auto it = entPos.find(qo.get("name"));
+                    if (qo.tag != "QuestObject" || it == entPos.end() || (p.type != "go to" && p.type != "checkpoint")) continue;
+                    float dist = p.attr.count("distance") ? (float)atof(p.attr.at("distance").c_str()) : 3.0f;
+                    if (glm::distance(it->second, camPos - glm::vec3(0, 1.7f, 0)) <= std::max(dist, 1.0f)) return true;
+                    if (!waitT.count(&p)) { waitT[&p] = 0; printf("quest %s: go to %s %s at %.0f %.0f %.0f\n", q.name.c_str(), p.name.c_str(), qo.get("name").c_str(), it->second.x, it->second.y, it->second.z); }
+                    return false;
+                }
+            float& t = waitT[&p];
+            if (t == 0) printf("quest %s: wait %s %s\n", q.name.c_str(), p.type.c_str(), p.name.c_str());
+            return (t += dt) >= 1.0f;
+        };
+        if (!quests.start(questName)) fprintf(stderr, "no quest %s\n", questName.c_str());
+    }
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -1048,6 +1080,7 @@ int main(int argc, char** argv) {
         uint64_t now = SDL_GetPerformanceCounter();
         float dt = shot.empty() ? (float)((double)(now - last) / (double)SDL_GetPerformanceFrequency()) : 1.0f / 60.0f;
         last = now;
+        if (!questName.empty()) quests.update(dt);
         glm::vec3 fwd(std::cos(pitch) * std::cos(yaw), std::sin(pitch), std::cos(pitch) * std::sin(yaw));
         glm::vec3 right = glm::normalize(glm::cross(fwd, glm::vec3(0, 1, 0)));
         const Uint8* k = SDL_GetKeyboardState(nullptr);

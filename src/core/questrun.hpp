@@ -45,6 +45,7 @@ private:
 class QuestManager : public QuestHost {
 public:
     void add(const QuestFile& f);
+    void loadAll(const std::string& dwDir);  // every data/quests/**/*.xml of Data*.pak (no _underlay files)
     const Quest* find(const std::string& name) const;
     const std::string& levelOf(const std::string& quest) const { static const std::string none; auto i = levels_.find(quest); return i == levels_.end() ? none : i->second; }
     bool start(const std::string& name);

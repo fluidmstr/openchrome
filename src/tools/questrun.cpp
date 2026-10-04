@@ -31,16 +31,7 @@ int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: oc_questrun <DW dir> <quest> [seconds]\n"); return 1; }
     float limit = argc > 3 ? (float)atof(argv[3]) : 600.0f;
     oc::QuestManager mgr;
-    for (auto& e : fs::directory_iterator(argv[1])) {
-        std::string p = e.path().string();
-        if (e.path().extension() != ".pak" || e.path().filename().string().rfind("Data", 0) != 0) continue;
-        for (auto& name : oc::listZip(p)) {
-            if (name.rfind("data/quests/", 0) != 0 || name.size() < 4 || name.substr(name.size() - 4) != ".xml" || name.find("_underlay") != std::string::npos) continue;
-            std::vector<uint8_t> b;
-            oc::QuestFile qf;
-            if (oc::readZipEntry(p, name, b) && oc::loadQuests(std::string(b.begin(), b.end()), qf)) mgr.add(qf);
-        }
-    }
+    mgr.loadAll(argv[1]);
     {
         std::vector<uint8_t> exp;
         std::string level = mgr.levelOf(argv[2]);

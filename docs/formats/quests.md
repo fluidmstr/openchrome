@@ -26,6 +26,8 @@ Execution model (guessed, produces sensible traces): phases of a sequence run in
 
 `src/core/questrun.{hpp,cpp}` (`QuestRunner`, `QuestManager`, host callbacks `onRun` / `onWait`) and `oc_questrun <DW dir> <quest> [seconds]` implement this on simulated time. Check: `Prologue` starts by hiding the HUD groups and the watch/flashlight, freezing time at 9:50, populating the Tower with NPC life places, then waits for the wake-up movie trigger, shows the `Tutorial_PrologueMove` hint and sends the player to the exit doors, i.e. the order of the real game intro.
 
+`oc_viewer <DW> <map> --quest <name>` runs a quest in the viewer: `set day night time` sets the clock, `go to` / `checkpoint` complete when the eye-minus-1.7 m position is within `distance` (min 1 m) of the named entity, other waits pass after 1 s, the rest is only logged.
+
 ## Open
 
 Semantics of each phase type and its attributes, the guard/AND/OR evaluation rules, how `Phase` nesting expresses sequence versus parallel, how `QuestObject` names resolve to map entities, and how texts (`&Q_..._Name&` keys) map to the localisation tables.

@@ -1,6 +1,9 @@
 #include "core/questrun.hpp"
 
 #include <cstdlib>
+#include <filesystem>
+
+#include "core/zip.hpp"
 
 namespace oc {
 
@@ -62,6 +65,20 @@ static bool step(const Quest& q, QuestHost& host, QuestExec& e, float dt) {
 
 void QuestManager::add(const QuestFile& f) {
     for (const Quest& q : f.quests) { quests_.emplace(q.name, q); levels_.emplace(q.name, f.level); }
+}
+
+void QuestManager::loadAll(const std::string& dwDir) {
+    namespace fs = std::filesystem;
+    for (auto& e : fs::directory_iterator(dwDir)) {
+        std::string f = e.path().filename().string();
+        if (e.path().extension() != ".pak" || f.rfind("Data", 0) != 0) continue;
+        for (auto& name : listZip(e.path().string())) {
+            if (name.rfind("data/quests/", 0) != 0 || name.size() < 4 || name.compare(name.size() - 4, 4, ".xml") != 0 || name.find("_underlay") != std::string::npos) continue;
+            std::vector<uint8_t> b;
+            QuestFile qf;
+            if (readZipEntry(e.path().string(), name, b) && loadQuests(std::string(b.begin(), b.end()), qf)) add(qf);
+        }
+    }
 }
 
 const Quest* QuestManager::find(const std::string& name) const {
